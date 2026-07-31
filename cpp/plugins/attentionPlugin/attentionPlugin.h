@@ -183,6 +183,12 @@ protected:
     bool mUseCuteDslFMHA{false};
 #endif
 
+#ifdef CUTE_DSL_FMHA_V2_ENABLED
+    bool mUseCuteDslFMHAV2{true};
+#else
+    bool mUseCuteDslFMHAV2{false};
+#endif
+
     //! Whether FMHA context kernels are available for this configuration.
     //! When false, prefill runs FFPA (headSize=512); other head sizes have no
     //! prefill support.

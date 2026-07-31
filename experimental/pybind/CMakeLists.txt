@@ -109,6 +109,16 @@ find_package(
   Python 3.10
   COMPONENTS Interpreter Development
   REQUIRED)
+if(NOT pybind11_DIR)
+  execute_process(
+    COMMAND "${Python_EXECUTABLE}" -m pybind11 --cmakedir
+    RESULT_VARIABLE _pybind11_cmakedir_result
+    OUTPUT_VARIABLE _pybind11_cmakedir
+    OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+  if(_pybind11_cmakedir_result EQUAL 0 AND IS_DIRECTORY "${_pybind11_cmakedir}")
+    list(PREPEND CMAKE_PREFIX_PATH "${_pybind11_cmakedir}")
+  endif()
+endif()
 find_package(pybind11 CONFIG REQUIRED)
 
 # ── Header include paths (from source tree) ───────────────────────────────

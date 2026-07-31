@@ -34,6 +34,11 @@
 #include "kernels/contextAttentionKernels/cuteDslFMHARunner.h"
 #endif
 
+// Portable CuTe DSL FMHA-v2 kernel, including native paged FP16 KV.
+#ifdef CUTE_DSL_FMHA_V2_ENABLED
+#include "kernels/contextAttentionKernels/cuteDslFMHAV2Runner.h"
+#endif
+
 // CuTe DSL FFPA kernel (headSize=512 fallback)
 #ifdef CUTE_DSL_FFPA_ENABLED
 #include "kernels/contextAttentionKernels/cuteDslFFPARunner.h"
@@ -154,38 +159,48 @@ AttentionExecutionMode deduceModeTreeAttention(
     return AttentionExecutionMode::kINVALID;
 }
 
-bool loadFMHAKernels(
-    bool& useCuteDslFMHA, int32_t headSize, int32_t smVersion, nvinfer1::DataType dataType, bool useSlidingWindow)
+bool loadFMHAKernels(bool& useCuteDslFMHA, bool& useCuteDslFMHAV2, int32_t numQHeads, int32_t numKVHeads,
+    int32_t headSize, int32_t smVersion, nvinfer1::DataType dataType, bool useSlidingWindow, bool enableFp8KVCache)
 {
-    bool canImplementFMHA = false;
 #ifdef CUTE_DSL_FMHA_ENABLED
     if (useCuteDslFMHA)
     {
         if (CuteDslFMHARunner::canImplement(headSize, smVersion) && CuteDslFMHARunner::loadLLMKernelModule())
         {
-            canImplementFMHA = true;
+            useCuteDslFMHAV2 = false;
             LOG_DEBUG("CuTe DSL FMHA kernel loaded for SM%d", smVersion);
+            return true;
         }
-        else
-        {
-            LOG_DEBUG("CuTe DSL FMHA not available (headSize=%d, SM%d), falling back to FMHA_v2", headSize, smVersion);
-            useCuteDslFMHA = false;
-        }
+        LOG_DEBUG("Optimized CuTe DSL FMHA not available (headSize=%d, SM%d)", headSize, smVersion);
+        useCuteDslFMHA = false;
     }
-    if (!useCuteDslFMHA)
 #endif
+
+#ifdef CUTE_DSL_FMHA_V2_ENABLED
+    if (useCuteDslFMHAV2)
     {
-        canImplementFMHA = ContextFMHARunner::canImplement(headSize, smVersion, dataType,
-            AttentionInputLayout::SEPARATE_Q_K_V,
-            useSlidingWindow ? ContextAttentionMaskType::SLIDING_OR_CHUNKED_CAUSAL : ContextAttentionMaskType::CAUSAL);
-        if (canImplementFMHA)
+        CuteDslFMHAV2MaskType const maskType
+            = useSlidingWindow ? CuteDslFMHAV2MaskType::kSLIDING_CAUSAL : CuteDslFMHAV2MaskType::kCAUSAL;
+        if (!enableFp8KVCache
+            && CuteDslFMHAV2Runner::canImplementPaged(numQHeads, numKVHeads, headSize, smVersion, dataType, maskType)
+            && CuteDslFMHAV2Runner::loadLLMKernelModule())
         {
-            if (!ContextFMHARunner::loadContextFMHAKernels(smVersion, dataType))
-            {
-                LOG_ERROR("Failed to load FMHA_v2 cubins for SM%d", smVersion);
-                canImplementFMHA = false;
-            }
+            LOG_DEBUG("Native paged CuTe DSL FMHA-v2 kernel loaded for SM%d", smVersion);
+            return true;
         }
+        LOG_DEBUG("Native paged CuTe DSL FMHA-v2 unavailable (headSize=%d, SM%d, fp8KV=%d)", headSize, smVersion,
+            enableFp8KVCache ? 1 : 0);
+        useCuteDslFMHAV2 = false;
+    }
+#endif
+
+    bool canImplementFMHA
+        = ContextFMHARunner::canImplement(headSize, smVersion, dataType, AttentionInputLayout::SEPARATE_Q_K_V,
+            useSlidingWindow ? ContextAttentionMaskType::SLIDING_OR_CHUNKED_CAUSAL : ContextAttentionMaskType::CAUSAL);
+    if (canImplementFMHA && !ContextFMHARunner::loadContextFMHAKernels(smVersion, dataType))
+    {
+        LOG_ERROR("Failed to load dense FMHA_v2 cubins for SM%d", smVersion);
+        canImplementFMHA = false;
     }
     return canImplementFMHA;
 }
@@ -406,10 +421,12 @@ AttentionPlugin::AttentionPlugin(std::string const& name, int32_t numQHeads, int
     mSMVersion = getSMVersion();
     applyThorSMRenumberWAR(mSMVersion);
 
-    LOG_DEBUG("AttentionPlugin FMHA path: %s, sliding_window: %s", mUseCuteDslFMHA ? "CuTe DSL FMHA" : "FMHA_v2",
+    mCanImplementFMHA = loadFMHAKernels(mUseCuteDslFMHA, mUseCuteDslFMHAV2, mNumQHeads, mNumKVHeads, mHeadSize,
+        mSMVersion, mDataType, mSlidingWindowSize > 0, mEnableFp8KVCache != 0);
+    LOG_DEBUG("AttentionPlugin FMHA path: %s, sliding_window: %s",
+        mUseCuteDslFMHA ? "optimized CuTe DSL FMHA"
+                        : (mUseCuteDslFMHAV2 ? "native paged CuTe DSL FMHA-v2" : "dense FMHA-v2"),
         mSlidingWindowSize > 0 ? std::to_string(mSlidingWindowSize).c_str() : "disabled");
-
-    mCanImplementFMHA = loadFMHAKernels(mUseCuteDslFMHA, mHeadSize, mSMVersion, mDataType, mSlidingWindowSize > 0);
 
     // XQA decode kernels are needed for decode path when available. Decode always reads the paged
     // pool (identity page table while cross-request reuse is off), so load the paged KV cache kernels.
@@ -525,9 +542,11 @@ AttentionPlugin::AttentionPlugin(std::string const& name, PluginFieldCollection 
     mSMVersion = getSMVersion();
     applyThorSMRenumberWAR(mSMVersion);
 
-    LOG_DEBUG("AttentionPlugin FMHA path: %s", mUseCuteDslFMHA ? "CuTe DSL FMHA" : "FMHA_v2");
-
-    mCanImplementFMHA = loadFMHAKernels(mUseCuteDslFMHA, mHeadSize, mSMVersion, mDataType, mSlidingWindowSize > 0);
+    mCanImplementFMHA = loadFMHAKernels(mUseCuteDslFMHA, mUseCuteDslFMHAV2, mNumQHeads, mNumKVHeads, mHeadSize,
+        mSMVersion, mDataType, mSlidingWindowSize > 0, mEnableFp8KVCache != 0);
+    LOG_DEBUG("AttentionPlugin FMHA path: %s",
+        mUseCuteDslFMHA ? "optimized CuTe DSL FMHA"
+                        : (mUseCuteDslFMHAV2 ? "native paged CuTe DSL FMHA-v2" : "dense FMHA-v2"));
 
     // XQA decode kernels. Decode always reads the paged pool, so load the paged KV cache kernels.
     mCanImplementXQA = DecoderXQARunner::canImplement(mNumQHeads, mNumKVHeads, mHeadSize, mSMVersion, mDataType,
@@ -1031,7 +1050,7 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc,
     rt::Tensor presentKVCacheTensor(
         outputs[kOUT_KV_CACHE_IDX], rt::Coords{kvCacheInputDesc.dims}, rt::DeviceType::kGPU, kvCacheInputDesc.type);
     rt::Tensor& kvCacheTensor = sharedKV ? pastKVCacheTensor : presentKVCacheTensor;
-#ifdef CUTE_DSL_FMHA_ENABLED
+#if defined(CUTE_DSL_FMHA_ENABLED) || defined(CUTE_DSL_FMHA_V2_ENABLED)
     // numPages feeds runPaged; only the CuTe DSL prefill reads it (writes and XQA decode derive
     // capacity from the page table), so it lives behind the same #ifdef as its call sites.
     int32_t const numPages = static_cast<int32_t>(kvCacheInputDesc.dims.d[1]);
@@ -1140,15 +1159,15 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc,
             LOG_ERROR("AttentionPlugin: shared-KV prefill cannot read an FP8 donor cache.");
             return -1;
         }
-        // Chunked prefill reads the cache back; only the CuTe DSL FMHA reads FP8.
-        // Normal prefill reads the FP16 K/V inputs and needs no FP8 kernel.
-        if (mEnableFp8KVCache && executionMode == AttentionExecutionMode::kCHUNKED_PREFILL
-            && !(mUseCuteDslFMHA && mCanImplementFMHA))
+        // Chunked prefill reads the cache back. The optimized CuTe DSL kernel
+        // consumes FP8 directly; dense FMHA-v2 uses splitPagedKV to dequantize
+        // the page-table-selected K/V into its FP16 workspace.
+        if (mEnableFp8KVCache && executionMode == AttentionExecutionMode::kCHUNKED_PREFILL && !mCanImplementFMHA)
         {
             LOG_ERROR(
-                "AttentionPlugin: FP8 KV cache chunked prefill requires the CuTe DSL FMHA path "
-                "(SM 100/101/110); the FP16-only prefill kernels cannot read the FP8 cache on SM %d.",
-                mSMVersion);
+                "AttentionPlugin: FP8 KV cache chunked prefill has no direct or split-KV FMHA backend "
+                "for headSize=%d on SM %d.",
+                mHeadSize, mSMVersion);
             return -1;
         }
 
@@ -1409,6 +1428,27 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc,
             }
             else
 #endif
+#ifdef CUTE_DSL_FMHA_V2_ENABLED
+                if (mUseCuteDslFMHAV2)
+            {
+                if (!validatePagedKVCacheShape())
+                {
+                    return 1;
+                }
+
+                int32_t const slidingWindow = mSlidingWindowSize > 0 ? mSlidingWindowSize - 1 : INT_MAX;
+                CuteDslFMHAV2Runner runner(
+                    mNumQHeads, mNumKVHeads, mHeadSize, runtimeBatchSize, runtimeSeqLen, kvCacheCapacity);
+                if (!runner.runPaged(qInputTensor.dataPointer<half>(), kvCacheTensor.rawPointer(), pageTable,
+                        attentionOutputTensor.dataPointer<half>(), cuQSeqLensTensor.dataPointer<int32_t>(),
+                        cuKVSeqLensTensor.dataPointer<int32_t>(), 2 * numPages, maxPagesPerSeq, rt::kTOKENS_PER_PAGE,
+                        stream, mAttentionScale, slidingWindow))
+                {
+                    return -1;
+                }
+            }
+            else
+#endif
             {
                 auto fmhaRunner = ContextFMHARunner(mDataType, runtimeBatchSize, runtimeSeqLen, mNumQHeads, mNumKVHeads,
                     mHeadSize, mSMVersion, AttentionInputLayout::SEPARATE_Q_K_V,
@@ -1549,6 +1589,31 @@ int32_t AttentionPlugin::enqueueImpl(PluginTensorDesc const* inputDesc,
                         attentionOutputTensor.dataPointer<half>(),    // O  [b, s_q, h_q, d]
                         paddedCuKVSeqLensTensor.dataPointer<int32_t>(), 2 * numPages, maxPagesPerSeq,
                         rt::kTOKENS_PER_PAGE, kvCacheTensor.getDataType(), stream, mAttentionScale, slidingWindow);
+                }
+            }
+            else
+#endif
+#ifdef CUTE_DSL_FMHA_V2_ENABLED
+                if (mUseCuteDslFMHAV2)
+            {
+                if (!validatePagedKVCacheShape())
+                {
+                    return 1;
+                }
+
+                kernel::launchApplyRopeWriteKVSplitQKV(ropeCosSinTensor, kvCacheEndIdxsTensor, qInputTensor,
+                    kInputTensor, vInputTensor, kvCacheWriteView, kScale, vScale, stream, pageTable, maxPagesPerSeq,
+                    /*fp8QOut=*/nullptr, /*qScale=*/1.0f);
+
+                int32_t const slidingWindow = mSlidingWindowSize > 0 ? mSlidingWindowSize - 1 : INT_MAX;
+                CuteDslFMHAV2Runner runner(
+                    mNumQHeads, mNumKVHeads, mHeadSize, runtimeBatchSize, runtimeSeqLen, kvCacheCapacity);
+                if (!runner.runPaged(qInputTensor.dataPointer<half>(), kvCacheTensor.rawPointer(), pageTable,
+                        attentionOutputTensor.dataPointer<half>(), cuQSeqLensTensor.dataPointer<int32_t>(),
+                        cuKVSeqLensTensor.dataPointer<int32_t>(), 2 * numPages, maxPagesPerSeq, rt::kTOKENS_PER_PAGE,
+                        stream, mAttentionScale, slidingWindow))
+                {
+                    return -1;
                 }
             }
             else

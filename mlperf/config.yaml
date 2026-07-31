@@ -1,4 +1,4 @@
-# MLPerf Edge-Agentic (BFCL v4) — Edge-LLM tree-MTP server. Both phases:
+# MLPerf Edge-Agentic (BFCL v4) — Edge-LLM MTP server. Both phases:
 #   performance (agentic replay, inline IoU) + accuracy (BFCL single-turn gate).
 # Deterministic (temp 0 / model seed 42), reasoning off, single-stream. Run from the
 # inference-endpoints repo root (the performance `path` is repo-relative).
