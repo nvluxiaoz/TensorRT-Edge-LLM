@@ -27,20 +27,34 @@ namespace trt_edgellm
 namespace kernel
 {
 
-//! \brief Embedding lookup for all modalities (supports FP16 and FP8 tables).
+//! \brief Embedding or PLE table of logical shape [rows, cols]; the format follows from the dtypes.
+//!
+//! - F16 or BF16 data [rows, cols], no scale.
+//! - FP8 E4M3 or INT8 data [rows, cols] with FP32 scale [rows, cols / group].
+//! - UINT8 data [rows, cols / 2] holding two 4-bit elements per byte, even element in the low nibble:
+//!   INT4 with FP32 scale (value = (nibble - 8) * scale), or NVFP4 E2M1 with FP8 E4M3 scale.
+//! Elements are decoded as value * scale * multiplier in FP32 and rounded once to the output type.
+struct EmbeddingTableDescriptor
+{
+    rt::Tensor const& data;
+    rt::OptionalInputTensor scale{std::nullopt};
+    float multiplier{1.0F};
+};
+
+//! \brief Validate a table descriptor and return its logical column count.
+//! \throws std::runtime_error naming the offending shape or dtype
+int64_t validateEmbeddingTable(EmbeddingTableDescriptor const& table);
+
+//! \brief Embedding lookup for all modalities.
 //!
 //! Produces input embeddings for a batch of token ids. Text tokens are looked up from the embedding
 //! table. When image and/or audio embeddings are supplied (prefill), positions whose token id equals
 //! imageTokenId / audioTokenId are filled from imageEmbeds / audioEmbeds, selected by multimodalIndices;
-//! with no image/audio inputs (decode) it performs a pure text lookup. Automatically dispatches to the
-//! FP16 or FP8 implementation based on the embedding table's datatype; FP8 tables require scales for
-//! per-group dequantization.
+//! with no image/audio inputs (decode) it performs a pure text lookup.
 //!
 //! \param[in] inputIds Input token IDs with shape [batchSize, seqLen]
-//! \param[in] embeddingTable Text embedding table with shape [vocabSize, hiddenSize] (FP16 or FP8)
-//! \param[in] scales FP32 per-group scales with shape [vocabSize, hiddenSize / blockSize];
-//!                   required when embeddingTable is FP8, std::nullopt for FP16
-//! \param[out] output Hidden states with shape [batchSize, seqLen, hiddenSize]
+//! \param[in] table Text embedding table of logical shape [vocabSize, hiddenSize]
+//! \param[out] output FP16 hidden states with shape [batchSize, seqLen, hiddenSize] or [physicalTokens, hiddenSize]
 //! \param[in] stream CUDA stream for execution
 //! \param[in] multimodalIndices Per-position indices into imageEmbeds/audioEmbeds [batchSize, seqLen];
 //!                              required when image or audio inputs are provided, std::nullopt otherwise
@@ -49,7 +63,13 @@ namespace kernel
 //! \param[in] audioTokenId Token ID marking audio positions, or std::nullopt if no audio input
 //! \param[in] audioEmbeds Audio embeddings [totalAudioTokens, hiddenSize] (FP16), or std::nullopt
 //! \note imageTokenId and audioTokenId must differ when both are provided.
-//! \throws std::runtime_error if tensor shapes or data types are invalid, or FP8 is not supported
+//! \throws std::runtime_error if tensor shapes or data types are invalid
+void embeddingLookup(rt::Tensor const& inputIds, EmbeddingTableDescriptor const& table, rt::Tensor& output,
+    cudaStream_t stream, rt::OptionalInputTensor multimodalIndices = std::nullopt,
+    std::optional<int32_t> imageTokenId = std::nullopt, rt::OptionalInputTensor imageEmbeds = std::nullopt,
+    std::optional<int32_t> audioTokenId = std::nullopt, rt::OptionalInputTensor audioEmbeds = std::nullopt);
+
+//! \brief Embedding lookup from a table and optional scales with a unit multiplier.
 void embeddingLookup(rt::Tensor const& inputIds, rt::Tensor const& embeddingTable, rt::OptionalInputTensor scales,
     rt::Tensor& output, cudaStream_t stream, rt::OptionalInputTensor multimodalIndices = std::nullopt,
     std::optional<int32_t> imageTokenId = std::nullopt, rt::OptionalInputTensor imageEmbeds = std::nullopt,
@@ -105,15 +125,20 @@ void generateVisionBlockIds(
 //! \brief Gather Gemma4 per-layer token-identity embeddings.
 //!
 //! \param[in] inputIds Input token IDs with shape [batchSize, seqLen]
-//! \param[in] pleTable PLE table with shape [vocabSize, numLayers * pleHiddenSize]
-//! \param[in,out] outputBuffer Backing tensor for all per-layer outputs; shape [numLayers, maxBatch, maxSeq, hidden]
+//! \param[in] pleTable PLE table of logical shape [vocabSize, numLayers * pleHiddenSize]; scale groups must
+//!                     not straddle layers
+//! \param[in,out] outputBuffer Backing tensor for all per-layer outputs; shape [numLayers, maxBatch, maxSeq, hidden];
+//!                             FP16, or BF16 for a BF16 table
 //! \param[in] numLayers Number of PLE layer outputs
 //! \param[in] pleHiddenSize Hidden size of each PLE output
 //! \param[in] imageTokenId Optional image token ID to zero-fill (-1 = unused)
 //! \param[in] audioTokenId Optional audio token ID to zero-fill (-1 = unused)
 //! \param[in] stream CUDA stream for execution
-void gemma4PleGather(rt::Tensor const& inputIds, rt::Tensor const& pleTable, rt::Tensor& outputBuffer,
-    int32_t numLayers, int32_t pleHiddenSize, int32_t imageTokenId, int32_t audioTokenId, cudaStream_t stream);
+//! \param[in] rowIndex Optional INT32 [batchSize, seqLen] row of pleTable per token, which then holds only the
+//!                     staged rows; a negative index zero-fills. Without it the token ID is the row.
+void gemma4PleGather(rt::Tensor const& inputIds, EmbeddingTableDescriptor const& pleTable, rt::Tensor& outputBuffer,
+    int32_t numLayers, int32_t pleHiddenSize, int32_t imageTokenId, int32_t audioTokenId, cudaStream_t stream,
+    rt::OptionalInputTensor rowIndex = std::nullopt);
 
 } // namespace kernel
 } // namespace trt_edgellm

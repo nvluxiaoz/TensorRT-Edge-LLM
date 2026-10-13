@@ -96,8 +96,12 @@ class _ShardFile:
             raise ValueError(
                 f"{name}: byte range [{offset}, {offset + length}) exceeds "
                 f"tensor storage ({size} bytes)")
+        # Read through the file so large row ranges do not stay mapped.
         start = self._data_start + int(begin) + offset
-        return self._mm[start:start + length]
+        data = os.pread(self._fh.fileno(), length, start)
+        if len(data) != length:
+            raise OSError(f"{name}: short read at {start} in {self.path}")
+        return data
 
     def close(self) -> None:
         try:
@@ -428,27 +432,35 @@ class SafetensorsStore:
 
     def get_f16_row(self, name: str, row: int) -> np.ndarray:
         """Read one row of a dense rank-two tensor as float16."""
+        return self.get_f32_rows(name, row, row + 1)[0].astype(np.float16)
+
+    def get_f32_rows(self, name: str, start: int, stop: int) -> np.ndarray:
+        """Read rows ``[start, stop)`` of a dense rank-two tensor as float32."""
         shape = self.shape(name)
-        if len(shape) != 2 or not 0 <= row < shape[0]:
-            raise ValueError(f"{name}: row {row} is outside shape {shape}")
+        if len(shape) != 2 or not 0 <= start < stop <= shape[0]:
+            raise ValueError(
+                f"{name}: rows [{start}, {stop}) are outside shape {shape}")
         dtype_str = self.dtype(name)
         if dtype_str not in ("F16", "BF16", "F32"):
             raise TypeError(
-                f"{name}: cannot decode dtype {dtype_str!r} to an f16 row")
+                f"{name}: cannot decode dtype {dtype_str!r} to f32 rows")
         if self._weight_map[name].endswith(".bin"):
             return (self._torch_tensor(name)
-                    [row].detach().cpu().float().numpy().astype(np.float16))
+                    [start:stop].detach().cpu().float().numpy())
 
         item_sizes = {"F16": 2, "BF16": 2, "F32": 4}
         columns = int(shape[1])
         row_bytes = columns * item_sizes[dtype_str]
-        raw = self._shard(name).raw_slice(name, row * row_bytes, row_bytes)
-        buffer = np.frombuffer(raw, dtype=np.uint8).copy()
+        raw = self._shard(name).raw_slice(name, start * row_bytes,
+                                          (stop - start) * row_bytes)
+        buffer = np.frombuffer(raw, dtype=np.uint8)
         if dtype_str == "F16":
-            return buffer.view(np.float16)
-        if dtype_str == "F32":
-            return buffer.view(np.float32).astype(np.float16)
-        return bf16_bytes_to_f32(buffer.view(np.uint16)).astype(np.float16)
+            rows = buffer.view(np.float16).astype(np.float32)
+        elif dtype_str == "F32":
+            rows = buffer.view(np.float32).copy()
+        else:
+            rows = bf16_bytes_to_f32(buffer.view(np.uint16))
+        return rows.reshape(stop - start, columns)
 
     def get_fp8_bytes(self, name: str) -> np.ndarray:
         """Return raw FP8 E4M3 bytes (uint8) with the stored shape."""

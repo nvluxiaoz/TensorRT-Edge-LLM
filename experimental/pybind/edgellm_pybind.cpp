@@ -64,6 +64,14 @@ using namespace trt_edgellm::rt;
 namespace
 {
 
+//! PLE storage from the Python names: residency "resident" or "cached" and an optional PLE source file.
+PleRuntimeConfig makePleConfig(std::string const& residency, std::string const& file)
+{
+    ELLM_CHECK(residency == "resident" || residency == "cached",
+        "ple_residency must be 'resident' or 'cached', got '" + residency + "'");
+    return PleRuntimeConfig{residency == "cached" ? PleResidency::kCACHED : PleResidency::kRESIDENT, file};
+}
+
 //! RAII wrapper for CUDA stream management.
 class CudaStreamWrapper
 {
@@ -248,24 +256,25 @@ public:
     //! identity-page runtime path unchanged when callers omit it.
     PyLLMRuntime(std::string const& engineDir, std::string const& multimodalEngineDir,
         std::unordered_map<std::string, std::string> const& loraWeightsMap, std::string const& checkpointDir,
-        ContextCacheConfig const& contextCacheConfig)
+        ContextCacheConfig const& contextCacheConfig, std::string const& pleResidency, std::string const& pleFile)
     {
         mPluginHandle = loadEdgellmPluginLib();
-        mRuntime = std::make_unique<LLMInferenceRuntime>(
-            engineDir, multimodalEngineDir, loraWeightsMap, mStream.get(), contextCacheConfig, checkpointDir);
+        mRuntime = std::make_unique<LLMInferenceRuntime>(engineDir, multimodalEngineDir, loraWeightsMap, mStream.get(),
+            contextCacheConfig, checkpointDir, makePleConfig(pleResidency, pleFile));
     }
 
     //! Speculative decoding constructor.
     PyLLMRuntime(std::string const& engineDir, std::string const& multimodalEngineDir,
         std::unordered_map<std::string, std::string> const& loraWeightsMap, int32_t draftTopK, int32_t draftStep,
         int32_t verifyTreeSize, std::string const& checkpointDir, std::string const& draftCheckpointDir,
-        ContextCacheConfig const& contextCacheConfig, int32_t dflashBlockSize)
+        ContextCacheConfig const& contextCacheConfig, int32_t dflashBlockSize, std::string const& pleResidency,
+        std::string const& pleFile)
     {
         mPluginHandle = loadEdgellmPluginLib();
         SpecDecodeDraftingConfig draftingConfig{draftTopK, draftStep, verifyTreeSize};
         draftingConfig.dflashBlockSize = dflashBlockSize;
         mRuntime = std::make_unique<LLMInferenceRuntime>(engineDir, multimodalEngineDir, loraWeightsMap, draftingConfig,
-            mStream.get(), contextCacheConfig, checkpointDir, draftCheckpointDir);
+            mStream.get(), contextCacheConfig, checkpointDir, draftCheckpointDir, makePleConfig(pleResidency, pleFile));
     }
 
     LLMGenerationResponse handleRequest(LLMGenerationRequest const& request)
@@ -507,13 +516,14 @@ public:
     PyRequestEngine(std::string const& engineDir, std::string const& multimodalEngineDir,
         std::unordered_map<std::string, std::string> const& loraWeightsMap, std::string const& checkpointDir,
         ContextCacheConfig const& contextCacheConfig, int32_t maxBatchSize, int32_t maxPendingRequests,
-        int32_t commandQueueCapacity, bool captureCudaGraph)
+        int32_t commandQueueCapacity, bool captureCudaGraph, std::string const& pleResidency,
+        std::string const& pleFile)
     {
         mPluginHandle = loadEdgellmPluginLib();
         // Single rank only in this release: tensor-parallel deployments stay on the blocking path
         // until the stepped command stream reaches the other ranks (see the IFB support matrix).
-        auto runtime = std::make_unique<LLMInferenceRuntime>(
-            engineDir, multimodalEngineDir, loraWeightsMap, mStream.get(), contextCacheConfig, checkpointDir);
+        auto runtime = std::make_unique<LLMInferenceRuntime>(engineDir, multimodalEngineDir, loraWeightsMap,
+            mStream.get(), contextCacheConfig, checkpointDir, makePleConfig(pleResidency, pleFile));
         // Capture happens here because after the constructor hands the runtime over, nothing but
         // the actor may touch it, and the actor has no pre-first-request hook to capture from.
         if (captureCudaGraph && !runtime->captureDecodingCUDAGraph(mStream.get()))
@@ -1103,18 +1113,20 @@ PYBIND11_MODULE(_edgellm_runtime, m)
     // ========================================================================
     py::class_<PyLLMRuntime>(m, "LLMRuntime", "Unified LLM inference runtime with optional speculative decoding.")
         .def(py::init<std::string const&, std::string const&, std::unordered_map<std::string, std::string> const&,
-                 std::string const&, ContextCacheConfig const&>(),
+                 std::string const&, ContextCacheConfig const&, std::string const&, std::string const&>(),
             py::arg("engine_dir"), py::arg("multimodal_engine_dir") = "",
             py::arg("lora_weights_map") = std::unordered_map<std::string, std::string>{},
             py::arg("checkpoint_dir") = "", py::arg("context_cache_config") = ContextCacheConfig{},
+            py::arg("ple_residency") = "resident", py::arg("ple_file") = "",
             "Construct for vanilla (non-speculative) decoding")
         .def(py::init<std::string const&, std::string const&, std::unordered_map<std::string, std::string> const&,
-                 int32_t, int32_t, int32_t, std::string const&, std::string const&, ContextCacheConfig const&,
-                 int32_t>(),
+                 int32_t, int32_t, int32_t, std::string const&, std::string const&, ContextCacheConfig const&, int32_t,
+                 std::string const&, std::string const&>(),
             py::arg("engine_dir"), py::arg("multimodal_engine_dir"), py::arg("lora_weights_map"),
             py::arg("draft_top_k"), py::arg("draft_step"), py::arg("verify_tree_size"), py::arg("checkpoint_dir") = "",
             py::arg("draft_checkpoint_dir") = "", py::arg("context_cache_config") = ContextCacheConfig{},
-            py::arg("dflash_block_size") = 0, "Construct for speculative decoding")
+            py::arg("dflash_block_size") = 0, py::arg("ple_residency") = "resident", py::arg("ple_file") = "",
+            "Construct for speculative decoding")
         .def("handle_request", &PyLLMRuntime::handleRequest, py::arg("request"),
             py::call_guard<py::gil_scoped_release>(), "Process a generation request and return the response")
         .def("load_omni", &PyLLMRuntime::loadOmni, py::arg("talker_engine_dir"), py::arg("code_predictor_engine_dir"),
@@ -1191,12 +1203,14 @@ PYBIND11_MODULE(_edgellm_runtime, m)
         "Owns a runtime and the actor thread that drives it; submissions from any thread, "
         "responses through RequestHandle.")
         .def(py::init<std::string const&, std::string const&, std::unordered_map<std::string, std::string> const&,
-                 std::string const&, ContextCacheConfig const&, int32_t, int32_t, int32_t, bool>(),
+                 std::string const&, ContextCacheConfig const&, int32_t, int32_t, int32_t, bool, std::string const&,
+                 std::string const&>(),
             py::arg("engine_dir"), py::arg("multimodal_engine_dir") = "",
             py::arg("lora_weights_map") = std::unordered_map<std::string, std::string>{},
             py::arg("checkpoint_dir") = "", py::arg("context_cache_config") = ContextCacheConfig{},
             py::arg("max_batch_size") = 1, py::arg("max_pending_requests") = 256,
-            py::arg("command_queue_capacity") = 64, py::arg("capture_cuda_graph") = true)
+            py::arg("command_queue_capacity") = 64, py::arg("capture_cuda_graph") = true,
+            py::arg("ple_residency") = "resident", py::arg("ple_file") = "")
         .def("submit", &PyRequestEngine::submit, py::arg("request"), py::call_guard<py::gil_scoped_release>(),
             "Queue a request. Returns immediately with a RequestHandle; raises SubmitError when refused.")
         .def("cancel", &PyRequestEngine::cancel, py::arg("request_id"), py::call_guard<py::gil_scoped_release>(),

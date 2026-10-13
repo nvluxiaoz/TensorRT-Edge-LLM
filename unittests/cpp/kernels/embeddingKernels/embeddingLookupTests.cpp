@@ -23,6 +23,8 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstring>
+#include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #if SUPPORTS_FP8
 #include <cuda_fp8.h>
@@ -32,6 +34,7 @@
 #include <gtest/gtest.h>
 #include <iomanip>
 #include <iostream>
+#include <random>
 #include <vector>
 
 using namespace trt_edgellm;
@@ -1345,6 +1348,275 @@ TEST_F(EmbeddingLookupTest, MultimodalOptionalInputs)
             << "GPU and CPU results don't match for " << tc.name << " multimodal lookup";
     }
 }
+
+#if SUPPORTS_FP8
+namespace
+{
+
+enum class QuantFormat
+{
+    kFP16,
+    kBF16,
+    kFP8,
+    kINT8,
+    kINT4,
+    kNVFP4,
+};
+
+//! Packed table bytes plus the decoded value and group scale of every logical element.
+struct HostTable
+{
+    nvinfer1::DataType dataType{nvinfer1::DataType::kHALF};
+    nvinfer1::DataType scaleType{nvinfer1::DataType::kFLOAT};
+    int64_t packedCols{0};
+    int64_t scaleCols{0};
+    std::vector<uint8_t> data;
+    std::vector<uint8_t> scale;
+    std::vector<float> decoded;
+    std::vector<float> elementScale;
+};
+
+template <typename T>
+void appendBytes(std::vector<uint8_t>& bytes, T value)
+{
+    uint8_t raw[sizeof(T)];
+    std::memcpy(raw, &value, sizeof(T));
+    bytes.insert(bytes.end(), raw, raw + sizeof(T));
+}
+
+float decodeE2m1Host(uint32_t nibble)
+{
+    constexpr float kMagnitudes[] = {0.0F, 0.5F, 1.0F, 1.5F, 2.0F, 3.0F, 4.0F, 6.0F};
+    float const value = kMagnitudes[nibble & 0x7U];
+    return (nibble & 0x8U) != 0U ? -value : value;
+}
+
+HostTable makeHostTable(QuantFormat format, int64_t rows, int64_t cols, int64_t group)
+{
+    std::mt19937 gen{1234};
+    std::uniform_real_distribution<float> valueDist(-1.0F, 1.0F);
+    std::uniform_real_distribution<float> scaleDist(0.01F, 0.1F);
+    std::uniform_int_distribution<int32_t> int8Dist(-127, 127);
+    std::uniform_int_distribution<int32_t> nibbleDist(0, 15);
+
+    bool const packed = format == QuantFormat::kINT4 || format == QuantFormat::kNVFP4;
+    bool const scaled = format != QuantFormat::kFP16 && format != QuantFormat::kBF16;
+    HostTable table;
+    table.packedCols = packed ? cols / 2 : cols;
+    table.scaleCols = scaled ? cols / group : 0;
+    table.decoded.resize(rows * cols);
+    table.elementScale.assign(rows * cols, 1.0F);
+
+    std::vector<float> groupScales(rows * table.scaleCols);
+    for (float& groupScale : groupScales)
+    {
+        if (format == QuantFormat::kNVFP4)
+        {
+            __nv_fp8_e4m3 const blockScale(scaleDist(gen) * 40.0F);
+            appendBytes(table.scale, blockScale);
+            groupScale = static_cast<float>(blockScale);
+        }
+        else
+        {
+            groupScale = scaleDist(gen);
+            appendBytes(table.scale, groupScale);
+        }
+    }
+
+    for (int64_t idx = 0; idx < rows * cols; ++idx)
+    {
+        int64_t const row = idx / cols;
+        int64_t const col = idx % cols;
+        if (scaled)
+        {
+            table.elementScale[idx] = groupScales[row * table.scaleCols + col / group];
+        }
+        switch (format)
+        {
+        case QuantFormat::kFP16:
+        {
+            half const value = __float2half(valueDist(gen));
+            appendBytes(table.data, value);
+            table.decoded[idx] = __half2float(value);
+            break;
+        }
+        case QuantFormat::kBF16:
+        {
+            __nv_bfloat16 const value = __float2bfloat16(valueDist(gen));
+            appendBytes(table.data, value);
+            table.decoded[idx] = __bfloat162float(value);
+            break;
+        }
+        case QuantFormat::kFP8:
+        {
+            __nv_fp8_e4m3 const value(valueDist(gen) * 400.0F);
+            appendBytes(table.data, value);
+            table.decoded[idx] = static_cast<float>(value);
+            break;
+        }
+        case QuantFormat::kINT8:
+        {
+            int8_t const value = static_cast<int8_t>(int8Dist(gen));
+            appendBytes(table.data, value);
+            table.decoded[idx] = static_cast<float>(value);
+            break;
+        }
+        case QuantFormat::kINT4:
+        case QuantFormat::kNVFP4:
+        {
+            uint32_t const nibble = static_cast<uint32_t>(nibbleDist(gen));
+            if (col % 2 == 0)
+            {
+                table.data.push_back(static_cast<uint8_t>(nibble));
+            }
+            else
+            {
+                table.data.back() |= static_cast<uint8_t>(nibble << 4U);
+            }
+            table.decoded[idx] = format == QuantFormat::kINT4 ? static_cast<float>(static_cast<int32_t>(nibble) - 8)
+                                                              : decodeE2m1Host(nibble);
+            break;
+        }
+        }
+    }
+
+    switch (format)
+    {
+    case QuantFormat::kFP16: table.dataType = nvinfer1::DataType::kHALF; break;
+    case QuantFormat::kBF16: table.dataType = nvinfer1::DataType::kBF16; break;
+    case QuantFormat::kFP8: table.dataType = nvinfer1::DataType::kFP8; break;
+    case QuantFormat::kINT8: table.dataType = nvinfer1::DataType::kINT8; break;
+    case QuantFormat::kINT4:
+    case QuantFormat::kNVFP4: table.dataType = nvinfer1::DataType::kUINT8; break;
+    }
+    table.scaleType = format == QuantFormat::kNVFP4 ? nvinfer1::DataType::kFP8 : nvinfer1::DataType::kFLOAT;
+    return table;
+}
+
+uint16_t halfBits(half value)
+{
+    uint16_t bits{};
+    std::memcpy(&bits, &value, sizeof(bits));
+    return bits;
+}
+
+struct QuantizedLookupCase
+{
+    char const* name;
+    QuantFormat format;
+    int64_t group;
+    float multiplier;
+};
+
+} // namespace
+
+class QuantizedEmbeddingLookupTest : public EmbeddingLookupTest,
+                                     public ::testing::WithParamInterface<QuantizedLookupCase>
+{
+};
+
+TEST_P(QuantizedEmbeddingLookupTest, MatchesHostDequantization)
+{
+    constexpr int64_t kBatchSize = 2;
+    constexpr int64_t kSeqLen = 4;
+    constexpr int32_t kVocabSize = 16;
+    constexpr int64_t kHiddenSize = 1536;
+    constexpr int32_t kImageTokenId = 9;
+    constexpr int64_t kImageTokens = 2;
+    QuantizedLookupCase const& param = GetParam();
+    std::vector<int32_t> const inputIds{0, 15, kImageTokenId, -1, 3, kVocabSize, kImageTokenId, 1};
+    std::vector<int32_t> const multimodalIndices{-1, -1, 0, -1, -1, -1, 1, -1};
+    std::vector<half> imageEmbeds(kImageTokens * kHiddenSize);
+    uniformFloatInitialization<half>(imageEmbeds, -1.0F, 1.0F);
+
+    HostTable const host = makeHostTable(param.format, kVocabSize, kHiddenSize, param.group);
+    rt::Tensor data({kVocabSize, host.packedCols}, rt::DeviceType::kGPU, host.dataType);
+    CUDA_CHECK(cudaMemcpy(data.rawPointer(), host.data.data(), host.data.size(), cudaMemcpyHostToDevice));
+    rt::Tensor scale;
+    rt::OptionalInputTensor scaleInput{std::nullopt};
+    if (host.scaleCols > 0)
+    {
+        scale = rt::Tensor({kVocabSize, host.scaleCols}, rt::DeviceType::kGPU, host.scaleType);
+        CUDA_CHECK(cudaMemcpy(scale.rawPointer(), host.scale.data(), host.scale.size(), cudaMemcpyHostToDevice));
+        scaleInput = scale;
+    }
+    rt::Tensor inputIdsTensor({kBatchSize, kSeqLen}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    rt::Tensor multimodalIndicesTensor({kBatchSize, kSeqLen}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    rt::Tensor imageEmbedsTensor({kImageTokens, kHiddenSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    rt::Tensor outputTensor({kBatchSize, kSeqLen, kHiddenSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    copyHostToDevice(inputIdsTensor, inputIds);
+    copyHostToDevice(multimodalIndicesTensor, multimodalIndices);
+    copyHostToDevice(imageEmbedsTensor, imageEmbeds);
+
+    kernel::embeddingLookup(inputIdsTensor, kernel::EmbeddingTableDescriptor{data, scaleInput, param.multiplier},
+        outputTensor, stream, rt::OptionalInputTensor{multimodalIndicesTensor}, kImageTokenId,
+        rt::OptionalInputTensor{imageEmbedsTensor});
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    auto const gpuResult = copyDeviceToHost<half>(outputTensor);
+
+    for (size_t token = 0; token < inputIds.size(); ++token)
+    {
+        int32_t const tokenId = inputIds[token];
+        bool const valid = tokenId >= 0 && tokenId < kVocabSize;
+        for (int64_t col = 0; col < kHiddenSize; ++col)
+        {
+            int64_t const element = tokenId * kHiddenSize + col;
+            half expected = __float2half(0.0F);
+            if (tokenId == kImageTokenId)
+            {
+                expected = imageEmbeds[multimodalIndices[token] * kHiddenSize + col];
+            }
+            else if (valid)
+            {
+                expected = __float2half(host.decoded[element] * (host.elementScale[element] * param.multiplier));
+            }
+            ASSERT_EQ(halfBits(gpuResult[token * kHiddenSize + col]), halfBits(expected))
+                << param.name << " token=" << token << " col=" << col;
+        }
+    }
+}
+
+INSTANTIATE_TEST_SUITE_P(TableFormats, QuantizedEmbeddingLookupTest,
+    ::testing::Values(QuantizedLookupCase{"FP16", QuantFormat::kFP16, 0, 1.0F},
+        QuantizedLookupCase{"FP16Multiplier", QuantFormat::kFP16, 0, 39.1875F},
+        QuantizedLookupCase{"BF16", QuantFormat::kBF16, 0, 1.0F},
+        QuantizedLookupCase{"FP8", QuantFormat::kFP8, 128, 1.0F},
+        QuantizedLookupCase{"INT8PerRow", QuantFormat::kINT8, 1536, 1.0F},
+        QuantizedLookupCase{"INT4", QuantFormat::kINT4, 128, 1.0F},
+        QuantizedLookupCase{"NVFP4", QuantFormat::kNVFP4, 16, 0.0375F}),
+    [](::testing::TestParamInfo<QuantizedLookupCase> const& info) { return std::string(info.param.name); });
+
+TEST_F(EmbeddingLookupTest, QuantizedTableRejectsInvalidLayouts)
+{
+    rt::Tensor inputIdsTensor({1, 1}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    rt::Tensor outputTensor({1, 1, 64}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    auto const lookup = [&](rt::Tensor const& data, rt::OptionalInputTensor scale) {
+        kernel::embeddingLookup(inputIdsTensor, kernel::EmbeddingTableDescriptor{data, scale}, outputTensor, stream);
+    };
+
+    rt::Tensor const int4Data({8, 32}, rt::DeviceType::kGPU, nvinfer1::DataType::kUINT8);
+    rt::Tensor const groupOf4({8, 16}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
+    EXPECT_THROW(lookup(int4Data, groupOf4), std::runtime_error) << "group must be a multiple of 8";
+
+    rt::Tensor const int8Data({8, 64}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT8);
+    rt::Tensor const shortScale({7, 1}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
+    EXPECT_THROW(lookup(int8Data, shortScale), std::runtime_error) << "scale rows must match table rows";
+
+    rt::Tensor const fp16Data({8, 64}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    rt::Tensor const strayScale({8, 1}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
+    EXPECT_THROW(lookup(fp16Data, strayScale), std::runtime_error) << "FP16 tables take no scale";
+
+    rt::Tensor const nvfp4Data({8, 24}, rt::DeviceType::kGPU, nvinfer1::DataType::kUINT8);
+    rt::Tensor const nvfp4Scale({8, 3}, rt::DeviceType::kGPU, nvinfer1::DataType::kFP8);
+    EXPECT_THROW(lookup(nvfp4Data, nvfp4Scale), std::runtime_error) << "4-bit width must be a multiple of 32";
+
+    rt::Tensor const int8Scale({8, 1}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
+    EXPECT_THROW(kernel::embeddingLookup(inputIdsTensor,
+                     kernel::EmbeddingTableDescriptor{int8Data, int8Scale, std::nanf("")}, outputTensor, stream),
+        std::runtime_error)
+        << "multiplier must be finite";
+}
+#endif
 
 // Test generateMultimodalIndices GPU kernel without per-row offsets (legacy global accumulation)
 TEST_F(EmbeddingLookupTest, GenerateMultimodalIndicesGlobalAccumulation)

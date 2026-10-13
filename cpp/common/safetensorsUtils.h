@@ -52,6 +52,10 @@ struct FileMetadata
 //! Convert a safetensors dtype name to the corresponding TensorRT type.
 nvinfer1::DataType dataTypeFromString(std::string_view dtype);
 
+//! Convert a TensorRT type to its safetensors dtype name.
+//! \throws std::runtime_error if the type has no safetensors name
+std::string dataTypeToString(nvinfer1::DataType dataType);
+
 //! Parse and validate a safetensors header from an existing file mapping.
 FileMetadata parseMetadata(void const* data, size_t bytes, std::string_view source);
 

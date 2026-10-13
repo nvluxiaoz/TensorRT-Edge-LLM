@@ -179,8 +179,8 @@ void runGatherTest(std::vector<int32_t> const& inputIds, int32_t batchSize, int3
     copyHostToDevice(pleTableDevice, table);
     copyHostToDevice(outputDevice, initialOutput);
 
-    kernel::gemma4PleGather(
-        inputIdsDevice, pleTableDevice, outputDevice, numLayers, pleHiddenSize, imageTokenId, audioTokenId, nullptr);
+    kernel::gemma4PleGather(inputIdsDevice, kernel::EmbeddingTableDescriptor{pleTableDevice}, outputDevice, numLayers,
+        pleHiddenSize, imageTokenId, audioTokenId, nullptr);
     CUDA_CHECK(cudaDeviceSynchronize());
 
     std::vector<T> const output = copyDeviceToHost<T>(outputDevice);
@@ -188,7 +188,109 @@ void runGatherTest(std::vector<int32_t> const& inputIds, int32_t batchSize, int3
         imageTokenId, audioTokenId);
 }
 
+//! Gathers an INT8 or INT4 PLE table with FP32 scales per (row, group) and checks every output element bit-exactly.
+void runQuantizedGatherTest(DataType dataType, int32_t group)
+{
+    constexpr int32_t kBatchSize = 2;
+    constexpr int32_t kSeqLen = 2;
+    constexpr int32_t kMaxBatchSize = 2;
+    constexpr int32_t kMaxSeqLen = 3;
+    constexpr int32_t kVocabSize = 5;
+    constexpr int32_t kNumLayers = 3;
+    constexpr int32_t kPleHiddenSize = 256;
+    constexpr int32_t kImageTokenId = 3;
+    constexpr int32_t kRowWidth = kNumLayers * kPleHiddenSize;
+    std::vector<int32_t> const inputIds{0, 4, kImageTokenId, 1};
+    bool const isInt4 = dataType == DataType::kUINT8;
+    int32_t const groupsPerRow = kRowWidth / group;
+
+    std::vector<int8_t> quantized(static_cast<size_t>(kVocabSize) * kRowWidth);
+    std::vector<uint8_t> packed;
+    std::vector<float> scales(static_cast<size_t>(kVocabSize) * groupsPerRow);
+    for (size_t idx = 0; idx < quantized.size(); ++idx)
+    {
+        quantized[idx] = static_cast<int8_t>(
+            isInt4 ? static_cast<int32_t>(idx * 7 % 16) - 8 : static_cast<int32_t>(idx * 37 % 255) - 127);
+        if (idx % 2 == 1)
+        {
+            packed.push_back(static_cast<uint8_t>((quantized[idx - 1] + 8) | ((quantized[idx] + 8) << 4)));
+        }
+    }
+    for (size_t idx = 0; idx < scales.size(); ++idx)
+    {
+        scales[idx] = 0.01F * static_cast<float>(idx + 1);
+    }
+
+    rt::Tensor inputIdsDevice({kBatchSize, kSeqLen}, rt::DeviceType::kGPU, DataType::kINT32);
+    rt::Tensor tableDevice({kVocabSize, isInt4 ? kRowWidth / 2 : kRowWidth}, rt::DeviceType::kGPU, dataType);
+    rt::Tensor scaleDevice({kVocabSize, groupsPerRow}, rt::DeviceType::kGPU, DataType::kFLOAT);
+    rt::Tensor outputDevice(
+        {kNumLayers, kMaxBatchSize, kMaxSeqLen, kPleHiddenSize}, rt::DeviceType::kGPU, DataType::kHALF);
+    copyHostToDevice(inputIdsDevice, inputIds);
+    if (isInt4)
+    {
+        copyHostToDevice(tableDevice, packed);
+    }
+    else
+    {
+        copyHostToDevice(tableDevice, quantized);
+    }
+    copyHostToDevice(scaleDevice, scales);
+    copyHostToDevice(outputDevice, makeFilledOutput<half>(kNumLayers, kMaxBatchSize, kMaxSeqLen, kPleHiddenSize));
+
+    kernel::gemma4PleGather(inputIdsDevice, kernel::EmbeddingTableDescriptor{tableDevice, scaleDevice}, outputDevice,
+        kNumLayers, kPleHiddenSize, kImageTokenId, /* audioTokenId = */ -1, nullptr);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    std::vector<half> const output = copyDeviceToHost<half>(outputDevice);
+    int64_t const layerCapacity = static_cast<int64_t>(kMaxBatchSize) * kMaxSeqLen * kPleHiddenSize;
+    for (int32_t layerIdx = 0; layerIdx < kNumLayers; ++layerIdx)
+    {
+        for (size_t token = 0; token < inputIds.size(); ++token)
+        {
+            int32_t const tokenId = inputIds[token];
+            for (int32_t hiddenIdx = 0; hiddenIdx < kPleHiddenSize; ++hiddenIdx)
+            {
+                int64_t const col = static_cast<int64_t>(layerIdx) * kPleHiddenSize + hiddenIdx;
+                int64_t const element = tokenId * kRowWidth + col;
+                float const expected = tokenId == kImageTokenId
+                    ? 0.0F
+                    : __half2float(__float2half(
+                          static_cast<float>(quantized[element]) * scales[tokenId * groupsPerRow + col / group]));
+                EXPECT_EQ(__half2float(output[layerIdx * layerCapacity + token * kPleHiddenSize + hiddenIdx]), expected)
+                    << "layer=" << layerIdx << " token=" << token << " hidden=" << hiddenIdx;
+            }
+        }
+        for (int64_t idx = static_cast<int64_t>(inputIds.size()) * kPleHiddenSize; idx < layerCapacity; ++idx)
+        {
+            EXPECT_EQ(__half2float(output[layerIdx * layerCapacity + idx]), kSentinelValue)
+                << "unwritten index=" << idx;
+        }
+    }
+}
+
 } // namespace
+
+TEST(Gemma4PleGatherKernelTest, GathersInt8TableWithGroup256)
+{
+    runQuantizedGatherTest(DataType::kINT8, /* group = */ 256);
+}
+
+TEST(Gemma4PleGatherKernelTest, GathersInt4TableWithGroup128)
+{
+    runQuantizedGatherTest(DataType::kUINT8, /* group = */ 128);
+}
+
+TEST(Gemma4PleGatherKernelTest, RejectsScaleGroupsSpanningLayers)
+{
+    rt::Tensor inputIds({1, 1}, rt::DeviceType::kGPU, DataType::kINT32);
+    rt::Tensor table({4, 512}, rt::DeviceType::kGPU, DataType::kINT8);
+    rt::Tensor perRowScale({4, 1}, rt::DeviceType::kGPU, DataType::kFLOAT);
+    rt::Tensor output({2, 1, 1, 256}, rt::DeviceType::kGPU, DataType::kHALF);
+    EXPECT_THROW(kernel::gemma4PleGather(inputIds, kernel::EmbeddingTableDescriptor{table, perRowScale}, output,
+                     /* numLayers = */ 2, /* pleHiddenSize = */ 256, -1, -1, nullptr),
+        std::runtime_error);
+}
 
 TEST(Gemma4PleGatherKernelTest, GathersFp16LayerOutputsWithCompactRuntimeShape)
 {
@@ -235,4 +337,75 @@ TEST(Gemma4PleGatherKernelTest, GathersBfloat16LayerOutputs)
 
     runGatherTest<__nv_bfloat16>(inputIds, kBatchSize, kSeqLen, kMaxBatchSize, kMaxSeqLen, kVocabSize, kNumLayers,
         kPleHiddenSize, /* imageTokenId = */ -1, /* audioTokenId = */ -1);
+}
+
+// Given a BF16 PLE table and a staging table holding only the distinct valid rows of a token batch,
+// when both are gathered to FP16 with a multiplier, the staged one through a per-token row index,
+// then the outputs are identical, including duplicates and zero-filled invalid and media tokens.
+TEST(Gemma4PleGatherKernelTest, StagedRowIndexMatchesResidentGather)
+{
+    constexpr int32_t kVocabSize = 6;
+    constexpr int32_t kNumLayers = 2;
+    constexpr int32_t kPleHiddenSize = 16;
+    constexpr int32_t kRowWidth = kNumLayers * kPleHiddenSize;
+    constexpr int32_t kImageTokenId = 5;
+    constexpr float kMultiplier = 16.0F;
+    std::vector<int32_t> const inputIds{3, 1, 3, -1, kVocabSize, kImageTokenId, 1, 0};
+    std::vector<int32_t> const stagedTokens{3, 1, 0};
+    // The image token points at a valid staged row; the kernel must still zero-fill it.
+    std::vector<int32_t> const rowIndex{0, 1, 0, -1, -1, 0, 1, 2};
+    int32_t const numTokens = static_cast<int32_t>(inputIds.size());
+
+    std::vector<__nv_bfloat16> table(static_cast<size_t>(kVocabSize) * kRowWidth);
+    for (size_t idx = 0; idx < table.size(); ++idx)
+    {
+        table[idx] = __float2bfloat16(0.37F * static_cast<float>(idx % 29) - 4.1F);
+    }
+    std::vector<__nv_bfloat16> staged;
+    for (int32_t tokenId : stagedTokens)
+    {
+        staged.insert(staged.end(), table.begin() + tokenId * kRowWidth, table.begin() + (tokenId + 1) * kRowWidth);
+    }
+
+    rt::Tensor inputIdsDevice({1, numTokens}, rt::DeviceType::kGPU, DataType::kINT32);
+    rt::Tensor rowIndexDevice({1, numTokens}, rt::DeviceType::kGPU, DataType::kINT32);
+    rt::Tensor tableDevice({kVocabSize, kRowWidth}, rt::DeviceType::kGPU, DataType::kBF16);
+    rt::Tensor stagedDevice(
+        {static_cast<int64_t>(stagedTokens.size()), kRowWidth}, rt::DeviceType::kGPU, DataType::kBF16);
+    rt::Tensor residentOutput({kNumLayers, 1, numTokens + 1, kPleHiddenSize}, rt::DeviceType::kGPU, DataType::kHALF);
+    rt::Tensor stagedOutput({kNumLayers, 1, numTokens + 1, kPleHiddenSize}, rt::DeviceType::kGPU, DataType::kHALF);
+    copyHostToDevice(inputIdsDevice, inputIds);
+    copyHostToDevice(rowIndexDevice, rowIndex);
+    copyHostToDevice(tableDevice, table);
+    copyHostToDevice(stagedDevice, staged);
+    std::vector<half> const sentinel = makeFilledOutput<half>(kNumLayers, 1, numTokens + 1, kPleHiddenSize);
+    copyHostToDevice(residentOutput, sentinel);
+    copyHostToDevice(stagedOutput, sentinel);
+
+    kernel::gemma4PleGather(inputIdsDevice, kernel::EmbeddingTableDescriptor{tableDevice, std::nullopt, kMultiplier},
+        residentOutput, kNumLayers, kPleHiddenSize, kImageTokenId, /* audioTokenId = */ -1, nullptr);
+    kernel::gemma4PleGather(inputIdsDevice, kernel::EmbeddingTableDescriptor{stagedDevice, std::nullopt, kMultiplier},
+        stagedOutput, kNumLayers, kPleHiddenSize, kImageTokenId, /* audioTokenId = */ -1, nullptr, rowIndexDevice);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    std::vector<half> const resident = copyDeviceToHost<half>(residentOutput);
+    std::vector<half> const stagedResult = copyDeviceToHost<half>(stagedOutput);
+    int64_t const layerCapacity = static_cast<int64_t>(numTokens + 1) * kPleHiddenSize;
+    for (size_t idx = 0; idx < resident.size(); ++idx)
+    {
+        int64_t const token = static_cast<int64_t>(idx) % layerCapacity / kPleHiddenSize;
+        int64_t const col
+            = static_cast<int64_t>(idx) / layerCapacity * kPleHiddenSize + static_cast<int64_t>(idx) % kPleHiddenSize;
+        float expected = kSentinelValue;
+        if (token < numTokens)
+        {
+            int32_t const tokenId = inputIds[token];
+            bool const valid = tokenId >= 0 && tokenId < kVocabSize && tokenId != kImageTokenId;
+            expected = valid
+                ? __half2float(__float2half(__bfloat162float(table[tokenId * kRowWidth + col]) * kMultiplier))
+                : 0.0F;
+        }
+        EXPECT_EQ(__half2float(stagedResult[idx]), __half2float(resident[idx])) << "index=" << idx;
+        EXPECT_EQ(__half2float(stagedResult[idx]), expected) << "index=" << idx;
+    }
 }

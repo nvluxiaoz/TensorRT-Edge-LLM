@@ -74,6 +74,7 @@ if TYPE_CHECKING:
 # Register model-family implementations before AutoModel dispatch below.
 from .. import _export_api as _registered_export_api  # noqa: F401
 from ..checkpoint.checkpoint_utils import normalize_rope_scaling_for_runtime
+from ..checkpoint.embedding_quantization import EMBEDDING_FORMATS
 from ..config import (_is_diffusion_gemma_model_type,
                       set_default_quantize_activations)
 from ..external_weights import (EXTERNAL_WEIGHT_CHOICES,
@@ -993,7 +994,8 @@ def _export_llm(model_dir: str,
                 model_type: str = "",
                 eagle_base: bool = False,
                 eagle_draft_dir: str = "",
-                fp8_embedding: bool = False,
+                embedding_quantization: str = "fp16",
+                ple_quantization: str = "fp16",
                 reduced_vocab_dir: str = "",
                 mtp_base: bool = False,
                 mtp_tree_base: bool = False,
@@ -1155,7 +1157,8 @@ def _export_llm(model_dir: str,
             export_onnx(model,
                         output_path,
                         model_dir=model_dir,
-                        fp8_embedding=fp8_embedding,
+                        embedding_quantization=embedding_quantization,
+                        ple_quantization=ple_quantization,
                         reduced_vocab_dir=reduced_vocab_dir,
                         externalize_weights=externalize_weights,
                         config_filename=config_filename,
@@ -1302,7 +1305,7 @@ def _export_diffusion_gemma_visual(model_dir: str, visual_out_dir: str,
 
 def _export_diffusion_gemma(model_dir: str,
                             output_dir: str,
-                            fp8_embedding: bool = False,
+                            embedding_quantization: str = "fp16",
                             reduced_vocab_dir: str = "",
                             externalize_weights: "list[str] | None" = None,
                             tp_size: int = 1) -> None:
@@ -1356,7 +1359,7 @@ def _export_diffusion_gemma(model_dir: str,
         export_onnx(backbone,
                     backbone_path,
                     model_dir=model_dir,
-                    fp8_embedding=fp8_embedding,
+                    embedding_quantization=embedding_quantization,
                     reduced_vocab_dir=reduced_vocab_dir,
                     externalize_weights=backbone_externalize_weights)
     except (OSError, ValueError, RuntimeError) as exc:
@@ -1701,11 +1704,11 @@ def _patch_dflash_mask_embedding(llm_out_dir: str,
         return
 
     with safe_open(emb_path, framework="pt", device="cpu") as f:
-        if "embedding_scale" in set(f.keys()):
-            raise ValueError(
-                label + " mask-embedding fold does not support FP8 "
-                "embedding.safetensors; re-export the base without "
-                "--fp8-embedding.")
+        if set(f.keys()) != {"embedding"}:
+            raise ValueError(label +
+                             " mask-embedding fold does not support quantized "
+                             "embedding.safetensors; re-export the base with "
+                             "--embedding-quantization fp16.")
         weight = f.get_tensor("embedding")
 
     patched_row = (draft_vec * embedding_scale).to(weight.dtype)
@@ -4132,12 +4135,31 @@ def main() -> None:
         ),
     )
     p.add_argument(
+        "--embedding-quantization",
+        "--embedding_quantization",
+        dest="embedding_quantization",
+        choices=EMBEDDING_FORMATS,
+        default=None,
+        help=("Format of embedding.safetensors (default fp16). fp8: E4M3 "
+              "with FP32 scales per 128; int8: one FP32 scale per row; "
+              "int4: FP32 scales per 128; nvfp4: E2M1 with E4M3 scales per "
+              "16 and one FP32 global scale."),
+    )
+    p.add_argument(
         "--fp8-embedding",
         "--fp8_embedding",
         dest="fp8_embedding",
         action="store_true",
-        help=
-        "Write embedding.safetensors in FP8 E4M3 format with per-row block scales.",
+        help="Alias for --embedding-quantization fp8.",
+    )
+    p.add_argument(
+        "--ple-quantization",
+        "--ple_quantization",
+        dest="ple_quantization",
+        choices=EMBEDDING_FORMATS,
+        default="fp16",
+        help=("Format of the Gemma 4 ple_embedding.safetensors, with the same "
+              "choices; int8 uses one scale per row and layer."),
     )
     p.add_argument(
         "--reduced-vocab-dir",
@@ -4410,6 +4432,12 @@ def main() -> None:
             "quantizes activations inside the plugin."),
     )
     args = p.parse_args()
+    if args.fp8_embedding:
+        if args.embedding_quantization not in (None, "fp8"):
+            p.error("--fp8-embedding conflicts with --embedding-quantization "
+                    f"{args.embedding_quantization}")
+        args.embedding_quantization = "fp8"
+    args.embedding_quantization = args.embedding_quantization or "fp16"
 
     # Select the INT4 GEMM plugin backend before any weight repack / op emission.
     set_int4_gemm_plugin_version(args.int4_gemm_plugin_version)
@@ -4424,6 +4452,9 @@ def main() -> None:
     model_type: str = config.get("model_type", "unknown")
     dtype = _dtype_from_str(args.dtype)
     is_gemma4_target = model_type in _GEMMA4_MODEL_TYPES
+    if args.ple_quantization != "fp16" and not is_gemma4_target:
+        p.error("--ple-quantization applies only to Gemma 4 per-layer "
+                f"embeddings; model type is {model_type!r}")
     requested_components = {
         c.strip()
         for c in args.components.split(",") if c.strip()
@@ -4721,15 +4752,14 @@ def main() -> None:
         logger.info("  %-15s: %s", "dllm",
                     "yes" if wants_diffusion_engines else "no")
         logger.info("  %-15s: %s", "visual", "yes" if wants_visual else "no")
-        logger.info("FP8 embedding : %s",
-                    "yes" if args.fp8_embedding else "no")
+        logger.info("Embedding     : %s", args.embedding_quantization)
         logger.info("TP size       : %d", args.tp_size)
         logger.info("=" * 60)
         if wants_diffusion_engines:
             _export_diffusion_gemma(
                 model_dir,
                 args.output_dir,
-                fp8_embedding=args.fp8_embedding,
+                embedding_quantization=args.embedding_quantization,
                 reduced_vocab_dir=args.reduced_vocab_dir,
                 externalize_weights=externalize_weights,
                 tp_size=args.tp_size,
@@ -4871,7 +4901,8 @@ def main() -> None:
              dspark_tree_base=args.dspark_tree_base,
              dspark_draft_dir=args.dspark_draft_dir,
              gemma4_mtp_base=gemma4_mtp_requested,
-             fp8_embedding=args.fp8_embedding,
+             embedding_quantization=args.embedding_quantization,
+             ple_quantization=args.ple_quantization,
              reduced_vocab_dir=args.reduced_vocab_dir,
              externalize_weights=externalize_weights,
              tp_size=args.tp_size,
@@ -4951,7 +4982,8 @@ def main() -> None:
     logger.info("Output dir    : %s", args.output_dir)
     for enabled, component, _ in stages:
         logger.info("  %-15s: %s", component, "yes" if enabled else "no")
-    logger.info("FP8 embedding : %s", "yes" if args.fp8_embedding else "no")
+    logger.info("Embedding     : %s", args.embedding_quantization)
+    logger.info("PLE embedding : %s", args.ple_quantization)
     logger.info("MTP capable   : %s", "yes" if has_mtp_draft else "no")
     logger.info("MTP export    : %s",
                 "yes" if args.mtp or gemma4_mtp_requested else "no")
@@ -4977,13 +5009,14 @@ def main() -> None:
                     args.num_decoder_layer)
     logger.info("=" * 60)
 
-    # ``--fp8-embedding`` only applies to the LLM thinker.  Models without a
-    # thinker (e.g. Qwen3-TTS) silently fall back to FP16 — warn so the user
+    # ``--embedding-quantization`` only applies to the LLM thinker.  Models
+    # without a thinker (e.g. Qwen3-TTS) fall back to FP16 — warn so the user
     # isn't surprised when the flag has no effect.
-    if args.fp8_embedding and not _has_llm_component(model_type, "thinker"):
+    if (args.embedding_quantization != "fp16"
+            and not _has_llm_component(model_type, "thinker")):
         logger.warning(
-            "--fp8-embedding is not supported for Talker / CodePredictor; "
-            "using FP16 embeddings.")
+            "--embedding-quantization is not supported for Talker / "
+            "CodePredictor; using FP16 embeddings.")
 
     if (_has_audio(model_type) and not args.skip_audio
             and _checkpoint_audio_config(config) is None):

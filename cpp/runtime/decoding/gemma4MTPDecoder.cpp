@@ -477,8 +477,8 @@ bool Gemma4MTPDecoder::prepareSeed(DecodingInferenceContext& context)
     CUDA_CHECK(cudaMemcpyAsync(mRuntime.preprocess.idsInput.rawPointer(), hostSeedTokens,
         activeBatchSize * sizeof(int32_t), cudaMemcpyHostToDevice, context.stream));
 
-    kernel::embeddingLookup(mRuntime.preprocess.idsInput, mRuntime.preprocess.embedding.table,
-        mRuntime.preprocess.embedding.scalesAsOptional(), mRuntime.base.pipelineIO.inputsEmbeds, context.stream);
+    kernel::embeddingLookup(mRuntime.preprocess.idsInput, mRuntime.preprocess.embedding.descriptor(),
+        mRuntime.base.pipelineIO.inputsEmbeds, context.stream);
 
     Tensor& sourceHiddenStates = mRuntime.base.pipelineIO.baseHiddenStates;
     Coords const sourceShape = sourceHiddenStates.getShape();
@@ -618,9 +618,8 @@ bool Gemma4MTPDecoder::runAssistantDraftChain(DecodingInferenceContext& context)
 
         if (step + 1 < draftingStep)
         {
-            kernel::embeddingLookup(mRuntime.sampling.indices, mRuntime.preprocess.embedding.table,
-                mRuntime.preprocess.embedding.scalesAsOptional(), mRuntime.base.pipelineIO.inputsEmbeds,
-                context.stream);
+            kernel::embeddingLookup(mRuntime.sampling.indices, mRuntime.preprocess.embedding.descriptor(),
+                mRuntime.base.pipelineIO.inputsEmbeds, context.stream);
             CUDA_CHECK(cudaMemcpyAsync(mRuntime.base.pipelineIO.draftHiddenStatesIn.rawPointer(),
                 mRuntime.base.pipelineIO.draftHiddenStatesOut.rawPointer(),
                 activeBatchSize * baseHiddenSize
@@ -715,8 +714,8 @@ bool Gemma4MTPDecoder::runBaseVerification(DecodingInferenceContext& context)
     check::check(mRuntime.base.pipelineIO.inputsEmbeds.reshape(
                      {activeBatchSize, verifySize, mRuntime.deployment.base.hiddenSize}),
         "Tensor reshape failed");
-    kernel::embeddingLookup(mRuntime.preprocess.idsInput, mRuntime.preprocess.embedding.table,
-        mRuntime.preprocess.embedding.scalesAsOptional(), mRuntime.base.pipelineIO.inputsEmbeds, context.stream);
+    kernel::embeddingLookup(mRuntime.preprocess.idsInput, mRuntime.preprocess.embedding.descriptor(),
+        mRuntime.base.pipelineIO.inputsEmbeds, context.stream);
     if (mRuntime.deployment.base.pleEnabled)
     {
         check::check(mRuntime.preprocess.gemma4Ple,

@@ -95,7 +95,8 @@ bool MmapReader::loadFile(std::filesystem::path const& fp, Mode mode)
         return false;
     }
     int const protection = mode == Mode::kCopyOnWrite ? PROT_READ | PROT_WRITE : PROT_READ;
-    int const flags = mode == Mode::kCopyOnWrite ? MAP_PRIVATE : MAP_SHARED;
+    // Pages are never written; NORESERVE keeps files larger than RAM from failing the overcommit check.
+    int const flags = mode == Mode::kCopyOnWrite ? MAP_PRIVATE | MAP_NORESERVE : MAP_SHARED;
     mData = mmap(nullptr, mBytes, protection, flags, fd, 0);
     if (mData == MAP_FAILED)
     {

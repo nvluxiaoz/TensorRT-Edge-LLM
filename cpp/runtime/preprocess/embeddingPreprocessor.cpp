@@ -60,12 +60,12 @@ void EmbeddingPreprocessor::embed(Tensor const& tokenIds, OptionalInputTensor vi
             mIndicesPtr = &mOwnedIndices;
         }
 
-        kernel::embeddingLookup(tokenIds, mEmbedding.table, mEmbedding.scalesAsOptional(), io.inputsEmbeds, stream,
+        kernel::embeddingLookup(tokenIds, mEmbedding.descriptor(), io.inputsEmbeds, stream,
             std::optional{std::ref(*mIndicesPtr)}, imageTokenOpt, visionEmbeds, audioTokenOpt, audioEmbeds);
     }
     else
     {
-        kernel::embeddingLookup(tokenIds, mEmbedding.table, mEmbedding.scalesAsOptional(), io.inputsEmbeds, stream);
+        kernel::embeddingLookup(tokenIds, mEmbedding.descriptor(), io.inputsEmbeds, stream);
     }
 }
 

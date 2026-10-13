@@ -26,6 +26,7 @@
 #include "profiling/timer.h"
 #include "runtime/config/deploymentConfig.h"
 #include "runtime/config/llmEngineConfig.h"
+#include "runtime/config/pleRuntimeConfig.h"
 #include "runtime/decoding/decoderRegistry.h"
 #include "runtime/decoding/guidedDecoder.h"
 #include "runtime/decoding/logitBias.h"
@@ -110,7 +111,8 @@ public:
         std::optional<SpecDecodeDraftingConfig> const& draftingConfig, cudaStream_t stream,
         ParallelMapping const& mapping, tokenizer::Tokenizer& tokenizer,
         chat_template::ChatTemplate const& chatTemplate, ContextCacheConfig const& contextCacheConfig,
-        std::string const& checkpointDir, std::string const& draftCheckpointDir);
+        std::string const& checkpointDir, std::string const& draftCheckpointDir,
+        PleRuntimeConfig const& pleConfig = {});
 
     LLMRankRuntime(ModelArtifacts&& artifacts, std::string const& engineDir, std::string const& multimodalEngineDir,
         std::unordered_map<std::string, std::string> const& loraWeightsMap,
@@ -517,7 +519,7 @@ private:
         std::optional<SpecDecodeDraftingConfig> const& draftingConfig, cudaStream_t stream,
         ParallelMapping const& mapping, tokenizer::Tokenizer& tokenizer,
         chat_template::ChatTemplate const& chatTemplate, ContextCacheConfig const& contextCacheConfig,
-        std::string const& checkpointDir, std::string const& draftCheckpointDir);
+        std::string const& checkpointDir, std::string const& draftCheckpointDir, PleRuntimeConfig const& pleConfig);
 
     void initializeCommon(ModelArtifacts&& artifacts, std::string const& engineDir,
         std::string const& multimodalEngineDir, std::unordered_map<std::string, std::string> const& loraWeightsMap,
@@ -582,8 +584,11 @@ private:
     //! (prefill) and the shared `zeroDeepstackBroadcast` (all other phases).
     std::unique_ptr<DeepstackBinding> mDeepstack;
 
-    std::unique_ptr<MultimodalRunner> mVisionRunner{nullptr};      //!< Vision multimodal runner (optional)
-    std::unique_ptr<MultimodalRunner> mAudioRunner{nullptr};       //!< Audio multimodal runner (optional)
+    std::unique_ptr<MultimodalRunner> mVisionRunner{nullptr};      //!< Vision runner, built on first use
+    std::unique_ptr<MultimodalRunner> mAudioRunner{nullptr};       //!< Audio runner, built on first use
+    std::string mVisionEngineDir;                                  //!< Empty when there is no vision engine
+    std::string mAudioEngineDir;                                   //!< Empty when there is no audio engine
+    rt::Tensor mEncoderExecContextMemory{};                        //!< Context memory for lazily built encoders
     std::unique_ptr<Alpamayo1ActionRunner> mActionRunner{nullptr}; //!< Action/diffusion head runner (optional)
     std::unique_ptr<ActionKvBatchCollector> mActionKvBatchCollector;
     tokenizer::Tokenizer* mTokenizer{nullptr};                 //!< Shared tokenizer owned by RuntimeCoordinator
@@ -688,6 +693,20 @@ private:
     //!        batch-resident mPipelineIO->mropeCosSin. The admission preprocess uses this: it runs
     //!        mid-generation against a temporary batch-1 context, and writing the resident cache
     //!        would clobber the running batch's rows.
+    bool hasVisionEngine() const noexcept
+    {
+        return !mVisionEngineDir.empty();
+    }
+    bool hasAudioEngine() const noexcept
+    {
+        return !mAudioEngineDir.empty();
+    }
+    void ensureVisionRunner(cudaStream_t stream);
+    void ensureAudioRunner(cudaStream_t stream);
+    std::unique_ptr<MultimodalRunner> createEncoderRunner(
+        std::string const& dir, std::string const& engineFile, char const* name, cudaStream_t stream);
+    void bindEncoderContextMemory(MultimodalRunner& runner, cudaStream_t stream);
+
     bool multiModalRuntimePreprocess(LLMGenerationRequest const& request, DecodingInferenceContext& context,
         cudaStream_t stream, OptionalOutputTensor mropeCosSinOverride = std::nullopt);
 

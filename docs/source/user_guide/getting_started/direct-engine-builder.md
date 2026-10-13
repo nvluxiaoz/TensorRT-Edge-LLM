@@ -309,7 +309,8 @@ are in `--checkpointDir`.
 | Runtime LoRA inputs | `--max-lora-rank N` |
 | Reduced vocabulary | `--reduced-vocab-dir DIR` |
 | DFlash V1 draft vocabulary | `--draft-reduced-vocab-dir DIR` |
-| FP8 embedding sidecar | `--fp8-embedding` |
+| Quantized embedding sidecars | `--embedding-quantization FORMAT`, `--ple-quantization FORMAT` (`--fp8-embedding` = `fp8`) |
+| INT4 tied LM head | `--lm-head-quantization int4` |
 | Tensor parallel rank | `--tp-size N --tp-rank R` |
 | Detailed TensorRT profiling names | `--profiling-detailed` |
 | Partial component rebuild | `--components NAME[,NAME...]` |

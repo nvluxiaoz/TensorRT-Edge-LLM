@@ -23,6 +23,7 @@
 #include "common/trtUtils.h"
 #include "profiling/nvtx_wrapper.h"
 #include "runtime/exec/engineExecutor.h"
+#include "runtime/llmRuntimeUtils.h"
 #include "runtime/weight/checkpointReader.h"
 #include "runtime/weight/checkpointWeightAssemble.h"
 
@@ -54,6 +55,8 @@ using Json = nlohmann::json;
 constexpr size_t kWeightAlignment = 256;
 constexpr size_t kPackedNvfp4ArenaAlignment = 2U << 20;
 constexpr char const* kStorageAliasField = "storage_alias_of";
+//! Embedding multiplier applied at lookup time, which lets a scaled embedding alias the unscaled tied head.
+constexpr char const* kLookupScaleField = "lookup_scale";
 constexpr char const* kRegisterPluginWeightSymbol = "edgellmRegisterFusedNvfp4WeightResource";
 constexpr char const* kUnregisterPluginWeightSymbol = "edgellmUnregisterFusedNvfp4WeightResource";
 using RegisterPluginWeightFn = bool (*)(int32_t, int32_t, void const*, void const*, int32_t, int32_t, int32_t);
@@ -269,12 +272,14 @@ void validateStorageAlias(Json const& alias, Json const& target)
         "Checkpoint storage alias cannot apply an embedding scale: " + aliasName);
     ELLM_CHECK(target.value("embedding_scale", 1.0f) == 1.0f,
         "Checkpoint storage alias target cannot apply an embedding scale: " + targetName);
+    ELLM_CHECK(!target.contains(kLookupScaleField),
+        "Checkpoint storage alias target cannot apply a lookup scale: " + targetName);
     ELLM_CHECK(!target.contains(kStorageAliasField),
         "Checkpoint storage aliases cannot form chains: " + aliasName + " -> " + targetName);
 
     Json aliasContract = alias;
     Json targetContract = target;
-    for (char const* field : {"engine_name", "role", "embedding_scale", kStorageAliasField})
+    for (char const* field : {"engine_name", "role", "embedding_scale", kLookupScaleField, kStorageAliasField})
     {
         aliasContract.erase(field);
         targetContract.erase(field);
@@ -299,6 +304,28 @@ void appendCheckpointKeys(Json const& binding, std::vector<std::string>& keys)
         ELLM_CHECK(key.is_string(), "checkpoint_keys entries must be strings");
         keys.push_back(key.get<std::string>());
     }
+}
+
+//! Unconverted checkpoint rows of a PLE binding; the binding's embedding_scale is applied at gather time.
+PleFileSource locatePleSource(CheckpointReader const& checkpoint, Json const& binding)
+{
+    std::string const name = binding.at("engine_name").get<std::string>();
+    std::string const assemble = binding.value("assemble", "");
+    std::vector<std::string> keys;
+    appendCheckpointKeys(binding, keys);
+    ELLM_CHECK(keys.size() == 1 && (assemble.empty() || assemble == "identity") && !binding.contains("tp_shard"),
+        "Cached PLE residency requires one unsharded identity checkpoint tensor: " + name);
+    CheckpointReader::TensorLocation const location = checkpoint.locate(keys.front());
+    nvinfer1::DataType const dtype = safetensors::dataTypeFromString(location.dtype);
+    ELLM_CHECK(dtype == nvinfer1::DataType::kHALF || dtype == nvinfer1::DataType::kBF16,
+        "Cached PLE residency reads F16 or BF16 rows, but checkpoint tensor " + location.name + " is "
+            + location.dtype);
+    ELLM_CHECK(location.shape.getNumDims() == 2 && location.shape == bindingShape(binding)
+            && location.bytes == static_cast<size_t>(location.shape.volume()) * utils::getTypeSize(dtype),
+        "Checkpoint tensor " + location.name + " " + location.shape.formatString()
+            + " does not match the PLE binding shape");
+    return PleFileSource{location.name, location.file, static_cast<int64_t>(location.offset), dtype, location.shape[0],
+        location.shape[1], binding.value("embedding_scale", 1.0F)};
 }
 
 size_t nonnegativeSize(Json const& value, std::string const& label)
@@ -440,7 +467,9 @@ ExternalWeightManager& ExternalWeightManager::operator=(ExternalWeightManager&& 
     mPluginResourceTensors = std::move(other.mPluginResourceTensors);
     mPluginResourceRegistrations = std::move(other.mPluginResourceRegistrations);
     mEmbedding = std::move(other.mEmbedding);
+    mEmbeddingLookupScale = other.mEmbeddingLookupScale;
     mPleEmbedding = std::move(other.mPleEmbedding);
+    mPleFileSource = std::move(other.mPleFileSource);
     mLoaded = std::exchange(other.mLoaded, false);
     mValidated = std::exchange(other.mValidated, false);
     mRegistered = std::exchange(other.mRegistered, false);
@@ -468,7 +497,8 @@ void ExternalWeightManager::releasePluginResources() noexcept
 
 void ExternalWeightManager::load(std::filesystem::path const& engineDir, std::filesystem::path const& configPath,
     cudaStream_t stream, std::filesystem::path const& componentCheckpointDir,
-    std::filesystem::path const& targetCheckpointDir, std::optional<int32_t> tpRank, std::optional<int32_t> tpSize)
+    std::filesystem::path const& targetCheckpointDir, std::optional<int32_t> tpRank, std::optional<int32_t> tpSize,
+    bool pleOnDisk)
 {
     NVTX_SCOPED_RANGE(nvtx_model_weight_preparation, "MODEL_WEIGHT_PREPARATION", nvtx_colors::YELLOW);
     ELLM_CHECK(!mLoaded, "ExternalWeightManager::load called more than once");
@@ -636,6 +666,7 @@ void ExternalWeightManager::load(std::filesystem::path const& engineDir, std::fi
                 = safetensors::dataTypeFromString(binding["dtype"].get_ref<std::string const&>());
             layouts[bindingIndex].shape = shape;
             layouts[bindingIndex].dtype = dtype;
+            layouts[bindingIndex].materialize = !(pleOnDisk && isPleEmbeddingBinding(binding));
         }
         bool const hasPackedNvfp4Weights = std::any_of(bindings.begin(), bindings.end(),
             [](Json const& binding) { return !binding.contains(kStorageAliasField) && isPackedNvfp4Binding(binding); });
@@ -643,11 +674,12 @@ void ExternalWeightManager::load(std::filesystem::path const& engineDir, std::fi
             for (size_t bindingIndex = 0; bindingIndex < bindings.size(); ++bindingIndex)
             {
                 Json const& binding = bindings[bindingIndex];
-                if (binding.contains(kStorageAliasField) || isPackedNvfp4Binding(binding) != packedNvfp4)
+                BindingLayout& layout = layouts[bindingIndex];
+                if (binding.contains(kStorageAliasField) || !layout.materialize
+                    || isPackedNvfp4Binding(binding) != packedNvfp4)
                 {
                     continue;
                 }
-                BindingLayout& layout = layouts[bindingIndex];
                 size_t const bytes = static_cast<size_t>(layout.shape.volume()) * utils::getTypeSize(layout.dtype);
                 ELLM_CHECK(bytes > 0, "Checkpoint binding has an empty tensor: " + binding.value("engine_name", ""));
                 storageBytes = alignWeightBytes(storageBytes);
@@ -850,12 +882,21 @@ void ExternalWeightManager::load(std::filesystem::path const& engineDir, std::fi
             else if (isEmbeddingBinding(binding))
             {
                 ELLM_CHECK(!mEmbedding.has_value(), "Runtime config has multiple embedding bindings");
+                mEmbeddingLookupScale = binding.value(kLookupScaleField, 1.0F);
+                ELLM_CHECK(mEmbeddingLookupScale == 1.0F || binding.value("embedding_scale", 1.0F) == 1.0F,
+                    "Embedding binding cannot apply both embedding_scale and lookup_scale: "
+                        + binding.at("engine_name").get<std::string>());
                 if (binding.at("engine_name").get<std::string>() != "__embedding__")
                 {
                     mWeights.emplace_back(storage + layout.offset, layout.shape, DeviceType::kGPU, layout.dtype,
                         binding.at("engine_name").get<std::string>());
                 }
                 mEmbedding = std::move(tensor);
+            }
+            else if (isPleEmbeddingBinding(binding) && !layout.materialize)
+            {
+                ELLM_CHECK(!mPleFileSource.has_value(), "Runtime config has multiple PLE embedding bindings");
+                mPleFileSource = locatePleSource(checkpointFor(binding), binding);
             }
             else if (isPleEmbeddingBinding(binding))
             {
@@ -900,12 +941,24 @@ void ExternalWeightManager::load(std::filesystem::path const& engineDir, std::fi
     }
 }
 
-std::optional<Tensor> ExternalWeightManager::takeEmbedding()
+std::optional<EmbeddingData> ExternalWeightManager::takeEmbedding()
 {
     ELLM_CHECK(mLoaded, "takeEmbedding called before load");
-    std::optional<Tensor> embedding = std::move(mEmbedding);
+    if (!mEmbedding.has_value())
+    {
+        return std::nullopt;
+    }
+    EmbeddingData embedding;
+    embedding.table = std::move(*mEmbedding);
+    embedding.multiplier = mEmbeddingLookupScale;
     mEmbedding.reset();
     return embedding;
+}
+
+std::optional<PleFileSource> ExternalWeightManager::takePleFileSource()
+{
+    ELLM_CHECK(mLoaded, "takePleFileSource called before load");
+    return std::exchange(mPleFileSource, std::nullopt);
 }
 
 std::optional<Tensor> ExternalWeightManager::takePleEmbedding()

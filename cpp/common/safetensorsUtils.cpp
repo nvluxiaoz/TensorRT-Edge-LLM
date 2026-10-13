@@ -34,13 +34,6 @@ namespace rt
 namespace safetensors
 {
 
-namespace
-{
-
-//! @brief Helper function to convert TensorRT data type to safetensors dtype string
-//! @param dataType TensorRT data type
-//! @return Safetensors dtype string
-//! @throws std::runtime_error If data type is unsupported
 std::string dataTypeToString(nvinfer1::DataType dataType)
 {
     switch (dataType)
@@ -57,6 +50,9 @@ std::string dataTypeToString(nvinfer1::DataType dataType)
     default: throw std::runtime_error("Unsupported data type for safetensors serialization");
     }
 }
+
+namespace
+{
 
 size_t nonnegativeSize(nlohmann::json const& value, std::string const& label)
 {

@@ -114,6 +114,10 @@ public:
 
     bool find(std::string const& name, View& view) const;
 
+    //! Return the shard and absolute byte range of one tensor.
+    //! \throws std::runtime_error if the tensor is not in the checkpoint
+    TensorLocation locate(std::string const& name) const;
+
 private:
     struct TensorInfo
     {

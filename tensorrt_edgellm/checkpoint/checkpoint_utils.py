@@ -1042,7 +1042,8 @@ def _runtime_embedding_scale(model: "CausalLM") -> float:
 def write_runtime_artifacts(model: "CausalLM",
                             model_dir: str,
                             out_dir: str,
-                            fp8_embedding: bool = False,
+                            embedding_quantization: str = "fp16",
+                            ple_quantization: str = "fp16",
                             reduced_vocab_dir: str = "",
                             config_filename: str = "config.json",
                             write_shared_artifacts: bool = True) -> None:
@@ -1061,6 +1062,7 @@ def write_runtime_artifacts(model: "CausalLM",
     from tensorrt_edgellm._safetensors_io import save_file
 
     from ..chat_template import write_chat_template
+    from .embedding_quantization import table_group_size, write_quantized_table
 
     os.makedirs(out_dir, exist_ok=True)
 
@@ -1154,20 +1156,16 @@ def write_runtime_artifacts(model: "CausalLM",
             if weight.dtype in (torch.float32, torch.bfloat16):
                 weight = weight.to(torch.float16)
             embedding_path = os.path.join(out_dir, "embedding.safetensors")
-            if fp8_embedding:
-                from .embedding_quantization import quantize_embedding_to_fp8
-                embedding_fp8, scales = quantize_embedding_to_fp8(weight)
-                save_file(
-                    {
-                        "embedding": embedding_fp8,
-                        "embedding_scale": scales
-                    }, embedding_path)
-                logger.info("Wrote FP8 embedding.safetensors (%s)",
-                            list(weight.shape))
-            else:
+            if embedding_quantization == "fp16":
                 save_file({"embedding": weight}, embedding_path)
                 logger.info("Wrote embedding.safetensors (%s)",
                             list(weight.shape))
+            else:
+                write_quantized_table(
+                    embedding_path, "embedding", tuple(weight.shape),
+                    lambda start, stop: weight[start:stop].float().numpy(),
+                    embedding_quantization,
+                    table_group_size(embedding_quantization, weight.shape[1]))
         else:
             logger.warning(
                 "embed_tokens not found; skipping embedding.safetensors")
@@ -1180,14 +1178,19 @@ def write_runtime_artifacts(model: "CausalLM",
                     "Gemma4 PLE is enabled but embed_tokens_per_layer is missing"
                 )
             ple_weight = ple_embed.weight.data.detach().cpu()
-            ple_weight = ple_weight * math.sqrt(
-                model.config.hidden_size_per_layer_input)
-            if ple_weight.dtype in (torch.float32, torch.bfloat16):
-                ple_weight = ple_weight.to(torch.float16)
-            ple_path = os.path.join(out_dir, "ple_embedding.safetensors")
-            save_file({"weight": ple_weight.contiguous()}, ple_path)
-            logger.info("Wrote ple_embedding.safetensors (%s)",
-                        list(ple_weight.shape))
+            layer_width = model.config.hidden_size_per_layer_input
+            ple_scale = math.sqrt(layer_width)
+            write_quantized_table(
+                os.path.join(out_dir, "ple_embedding.safetensors"), "weight",
+                tuple(ple_weight.shape), lambda start, stop:
+                (ple_weight[start:stop] * ple_scale).float().numpy(),
+                ple_quantization,
+                table_group_size(ple_quantization, ple_weight.shape[1],
+                                 layer_width))
+        elif ple_quantization != "fp16":
+            raise ValueError(
+                "--ple-quantization requires a model with per-layer "
+                "embeddings (Gemma 4 E2B/E4B)")
 
     # Alpamayo-R1: tokenizer lives in the VLM checkpoint, not in model_dir.
     # Build it first so that tokenizer files exist before the copy loop

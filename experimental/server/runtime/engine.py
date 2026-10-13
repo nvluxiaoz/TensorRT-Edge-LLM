@@ -867,9 +867,17 @@ class LLM:
         context_cache_config: Optional[Union[ContextCacheConfig,
                                              Mapping[str, Any]]] = None,
         enable_in_flight_batching: bool = False,
+        embedding_quantization: str = "fp16",
+        ple_quantization: str = "fp16",
+        lm_head_quantization: str = "fp16",
+        ple_residency: str = "resident",
+        ple_file: str = "",
     ):
         if not model:
             raise ValueError("'model' must be provided")
+        if ple_residency not in ("resident", "cached"):
+            raise ValueError("ple_residency must be 'resident' or 'cached', "
+                             f"got {ple_residency!r}")
         if (isinstance(engine_cache_max_size_gb, bool)
                 or not math.isfinite(engine_cache_max_size_gb)
                 or engine_cache_max_size_gb <= 0):
@@ -899,6 +907,8 @@ class LLM:
         self._context_cache_config = ContextCacheConfig.parse(
             context_cache_config)
         self._enable_in_flight_batching = enable_in_flight_batching
+        self._ple_residency = ple_residency
+        self._ple_file = ple_file
         self._admission_sem = threading.Semaphore(1)
         self._infer_lock = threading.Lock()
         self._close_lock = threading.Lock()
@@ -924,6 +934,9 @@ class LLM:
             max_draft_tree_size=max_draft_tree_size,
             max_image_tokens=max_image_tokens,
             max_image_tokens_per_image=max_image_tokens_per_image,
+            embedding_quantization=embedding_quantization,
+            ple_quantization=ple_quantization,
+            lm_head_quantization=lm_head_quantization,
         )
         spec_method = options.spec_type
         num_speculative_tokens = None
@@ -1013,6 +1026,10 @@ class LLM:
         self._rt = _import_runtime()
         context_cache_config = _native_context_cache_config(
             self._rt, self._context_cache_config)
+        ple_options = {
+            "ple_residency": getattr(self, "_ple_residency", "resident"),
+            "ple_file": getattr(self, "_ple_file", ""),
+        }
         logger.info("Loading runtime bundle from %s", self._bundle_dir)
         # Asked for and not available is a configuration error, not a silent
         # fallback: the operator would otherwise believe requests overlap when
@@ -1041,6 +1058,7 @@ class LLM:
                 self._draft_model_dir,
                 context_cache_config,
                 self._dflash_block_size,
+                **ple_options,
             )
         elif self._use_ifb():
             # In-flight batching: the engine owns the runtime and the one
@@ -1057,6 +1075,7 @@ class LLM:
                     self._model_dir,
                     context_cache_config,
                     max_batch_size=self._max_batch_size,
+                    **ple_options,
                 )
                 logger.info("In-flight batching enabled (max_batch_size=%d)",
                             self._max_batch_size)
@@ -1086,6 +1105,7 @@ class LLM:
                 {},
                 self._model_dir,
                 context_cache_config,
+                **ple_options,
             )
         if getattr(self, "_runtime", None) is not None:
             self._runtime.capture_decoding_cuda_graph()
@@ -2180,6 +2200,15 @@ def load_model(**kwargs):
         if kwargs.pop("speculative_config", None):
             raise ValueError(
                 "standalone TTS models do not support speculative decoding")
+        for name in ("embedding_quantization", "ple_quantization",
+                     "lm_head_quantization"):
+            if kwargs.pop(name, "fp16") != "fp16":
+                raise ValueError(
+                    f"standalone TTS models do not support {name}")
+        if (kwargs.pop("ple_residency", "resident") != "resident"
+                or kwargs.pop("ple_file", "")):
+            raise ValueError(
+                "standalone TTS models do not have per-layer embeddings")
         if kwargs.pop("enable_in_flight_batching", False):
             raise _ifb_unsupported_error(
                 ifb_unsupported_reason(None, model_type=model_type))

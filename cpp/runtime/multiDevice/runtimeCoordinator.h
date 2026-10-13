@@ -18,6 +18,7 @@
 #pragma once
 
 #include "runtime/config/deploymentConfig.h"
+#include "runtime/config/pleRuntimeConfig.h"
 #include "runtime/generationBoundary.h"
 #include "runtime/llmRuntimeUtils.h"
 #include "runtime/modelArtifacts.h"
@@ -75,6 +76,7 @@ public:
         ContextCacheConfig contextCacheConfig;
         std::string checkpointDir;
         std::string draftCheckpointDir;
+        PleRuntimeConfig pleConfig;
         std::vector<int32_t> localRanks;
         std::unordered_map<int32_t, int32_t> localRankDevices;
         std::vector<cudaStream_t> localStreams;

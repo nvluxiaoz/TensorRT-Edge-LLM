@@ -19,6 +19,7 @@
 
 #include "action/alpamayo1RunnerUtils.h"
 #include "common/tensor.h"
+#include "kernels/embeddingKernels/embeddingKernels.h"
 #include "runtime/audioUtils.h"
 #include "runtime/imageUtils.h"
 #include "runtime/state/contextCache/contextCacheConfig.h"
@@ -471,44 +472,32 @@ std::vector<int32_t> buildBatchMapping(std::vector<int8_t> const& finishedStates
 // Embedding Loading Utilities
 //=============================================================================
 
-/*! \brief FP8 embedding block size (fixed at 128)
- *
- *  This matches the quantization granularity: scales shape is [vocabSize, hiddenSize/128]
- */
-inline constexpr int64_t kFP8EmbeddingBlockSize = 128;
-
-/*! \brief Embedding data - supports both FP16 and FP8 formats
- *
- *  The embedding table datatype determines the format:
- *  - FP16: table is FP16, tableScalingFactor is empty
- *  - FP8: table is FP8 (E4M3), tableScalingFactor contains FP32 per-group scales
- *
- *  The kernel functions automatically dispatch based on table.getDataType().
- */
+/*! \brief Embedding or PLE table owned by the runtime; see kernel::EmbeddingTableDescriptor for the formats. */
 struct EmbeddingData
 {
-    rt::Tensor table;              //!< Embedding table [vocabSize, hiddenSize] (FP16 or FP8)
-    rt::Tensor tableScalingFactor; //!< FP32 per-group scales [vocabSize, hiddenSize/128] (only if FP8)
+    rt::Tensor table;              //!< Packed table [rows, packed cols]
+    rt::Tensor tableScalingFactor; //!< Per-group scales [rows, cols / group]; empty for FP16/BF16
+    float multiplier{1.0F};        //!< Applied in FP32 to every decoded element
 
-    //! \brief Returns scales as OptionalInputTensor (std::nullopt when FP16, reference when FP8)
-    rt::OptionalInputTensor scalesAsOptional() const
+    kernel::EmbeddingTableDescriptor descriptor() const
     {
-        return tableScalingFactor.getShape().volume() > 0 ? rt::OptionalInputTensor{tableScalingFactor} : std::nullopt;
+        return kernel::EmbeddingTableDescriptor{table,
+            tableScalingFactor.getShape().volume() > 0 ? rt::OptionalInputTensor{tableScalingFactor} : std::nullopt,
+            multiplier};
     }
 };
 
-/*! \brief Load embedding table from safetensors file (auto-detects FP16 vs FP8 by dtype)
+/*! \brief Load an embedding or PLE table from a safetensors sidecar
  *
- *  Loads embedding.safetensors and detects format by checking the "embedding" tensor dtype:
- *  - FP8: loads "embedding" (FP8) + "embedding_scale" (FP32)
- *  - FP16: loads "embedding" (FP16)
+ *  The file holds `tensorName` plus, by format: nothing (FP16/BF16), `<tensorName>_scale` (FP8/INT8/INT4), or
+ *  `<tensorName>_block_scale` and the FP32 scalar `<tensorName>_multiplier_scale` (NVFP4). Other tensors are rejected.
  *
- *  \param embeddingPath Path to embedding.safetensors file
+ *  \param path Path to the safetensors file
+ *  \param tensorName Name of the table tensor
  *  \param stream CUDA stream for async operations
- *  \return EmbeddingData with loaded tensors and format flag
- *  \throws std::runtime_error if file not found, tensors missing, or invalid dtypes
+ *  \throws std::runtime_error if the file is missing or the tensors do not form a valid table
  */
-EmbeddingData loadEmbeddingTable(std::filesystem::path const& embeddingPath, cudaStream_t stream);
+EmbeddingData loadEmbeddingTable(std::filesystem::path const& path, std::string const& tensorName, cudaStream_t stream);
 
 /*!
  * @brief Clamp max generation length against KV-cache capacity across the full active batch

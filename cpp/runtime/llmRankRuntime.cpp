@@ -160,10 +160,10 @@ LLMRankRuntime::LLMRankRuntime(std::string const& engineDir, std::string const& 
     std::optional<SpecDecodeDraftingConfig> const& draftingConfig, cudaStream_t stream, ParallelMapping const& mapping,
     tokenizer::Tokenizer& tokenizer, chat_template::ChatTemplate const& chatTemplate,
     ContextCacheConfig const& contextCacheConfig, std::string const& checkpointDir,
-    std::string const& draftCheckpointDir)
+    std::string const& draftCheckpointDir, PleRuntimeConfig const& pleConfig)
 {
     initializeFromEngineDir(engineDir, multimodalEngineDir, loraWeightsMap, draftingConfig, stream, mapping, tokenizer,
-        chatTemplate, contextCacheConfig, checkpointDir, draftCheckpointDir);
+        chatTemplate, contextCacheConfig, checkpointDir, draftCheckpointDir, pleConfig);
 }
 
 LLMRankRuntime::LLMRankRuntime(ModelArtifacts&& artifacts, std::string const& engineDir,
@@ -195,7 +195,7 @@ void LLMRankRuntime::initializeFromEngineDir(std::string const& engineDir, std::
     std::optional<SpecDecodeDraftingConfig> const& draftingConfig, cudaStream_t stream, ParallelMapping const& mapping,
     tokenizer::Tokenizer& tokenizer, chat_template::ChatTemplate const& chatTemplate,
     ContextCacheConfig const& contextCacheConfig, std::string const& checkpointDir,
-    std::string const& draftCheckpointDir)
+    std::string const& draftCheckpointDir, PleRuntimeConfig const& pleConfig)
 {
     int32_t const tensorParallelSize = mapping.tensorParallelSize;
     int32_t const tensorParallelRank = mapping.tensorParallelRank;
@@ -215,22 +215,25 @@ void LLMRankRuntime::initializeFromEngineDir(std::string const& engineDir, std::
         : engineRoot / parallel_artifacts::configFileName(artifactContext);
     artifacts.checkpointDir = checkpointDir;
     artifacts.draftCheckpointDir = draftCheckpointDir;
+    artifacts.pleConfig = pleConfig;
 
     // Finish checkpoint reads and weight conversion before any engine can run.
     std::optional<int32_t> const weightTpRank
         = tensorParallelSize > 1 ? std::optional<int32_t>{tensorParallelRank} : std::nullopt;
     std::optional<int32_t> const weightTpSize
         = tensorParallelSize > 1 ? std::optional<int32_t>{tensorParallelSize} : std::nullopt;
-    artifacts.weights.load(engineRoot, baseConfigPath, stream, artifacts.checkpointDir, {}, weightTpRank, weightTpSize);
+    artifacts.weights.load(engineRoot, baseConfigPath, stream, artifacts.checkpointDir, {}, weightTpRank, weightTpSize,
+        pleConfig.residency == PleResidency::kCACHED);
     if (auto embedding = artifacts.weights.takeEmbedding())
     {
-        artifacts.embedding.table = std::move(*embedding);
+        artifacts.embedding = std::move(*embedding);
     }
     else
     {
-        artifacts.embedding = loadEmbeddingTable(engineRoot / "embedding.safetensors", stream);
+        artifacts.embedding = loadEmbeddingTable(engineRoot / "embedding.safetensors", "embedding", stream);
     }
     artifacts.pleEmbedding = artifacts.weights.takePleEmbedding();
+    artifacts.pleFileSource = artifacts.weights.takePleFileSource();
 
     // Parse engine configurations and attach user drafting. The bundle factory
     // performs cross-engine consistency and drafting-vs-capacity checks.
@@ -340,6 +343,8 @@ void LLMRankRuntime::initializeCommon(ModelArtifacts&& artifacts, std::string co
     std::unique_ptr<EngineExecutor> draftExecutor = std::move(artifacts.draftExecutor);
     ExternalWeightManager draftWeights = std::move(artifacts.draftWeights);
     auto pleEmbedding = std::move(artifacts.pleEmbedding);
+    PleRuntimeConfig const pleConfig = artifacts.pleConfig;
+    auto pleFileSource = std::move(artifacts.pleFileSource);
     auto vocabMap = std::move(artifacts.vocabMap);
 
     // The same engine uses bounded SWA pages when they save memory and its full KV profile otherwise or for reuse.
@@ -554,9 +559,21 @@ void LLMRankRuntime::initializeCommon(ModelArtifacts&& artifacts, std::string co
     }
     if (mDeployment.base.pleEnabled)
     {
+        // Cached rows are read with host token ids, which only vanilla decoding passes to the PLE gather.
+        ELLM_CHECK(pleConfig.residency == PleResidency::kRESIDENT
+                || (!draftingConfig.has_value() && !mDeployment.base.isDiffusionBackbone
+                    && mMapping.tensorParallelSize == 1),
+            "Cached PLE residency supports only single-rank vanilla decoding; it cannot be combined with speculative "
+            "decoding, diffusion decoding or tensor parallelism. Use resident PLE.");
         int32_t const maxPleSeqLen = std::max(maxInputLength, std::max(1, mDeployment.base.maxVerifyTreeSize));
         mGemma4Ple = std::make_unique<Gemma4EmbeddingPreprocessor>(std::filesystem::path(engineDir), mDeployment.base,
-            mMaxRuntimeBatchSize, maxPleSeqLen, mBaseTensorMap, stream, std::move(pleEmbedding));
+            mMaxRuntimeBatchSize, maxPleSeqLen, mBaseTensorMap, stream, std::move(pleEmbedding), pleConfig,
+            std::move(pleFileSource));
+    }
+    else
+    {
+        ELLM_CHECK(pleConfig.residency == PleResidency::kRESIDENT && pleConfig.filePath.empty(),
+            "PLE residency options require a model with per-layer embeddings");
     }
     LOG_INFO("Runtime tensors successfully allocated.");
 
@@ -590,32 +607,24 @@ void LLMRankRuntime::initializeCommon(ModelArtifacts&& artifacts, std::string co
     // -----------------------------------------------------------------------
     if (!multimodalEngineDir.empty())
     {
-        // A missing engine file means the deployment simply has no such
-        // encoder. One that is present but fails to load is fatal: continuing
-        // would answer image and audio prompts from the text tokens alone.
-        auto loadRunner = [&](std::string const& dir, std::string const& engineFile,
-                              std::string const& name) -> std::unique_ptr<MultimodalRunner> {
-            if (!std::filesystem::exists(std::filesystem::path(dir) / engineFile))
-            {
-                LOG_DEBUG("No %s engine at %s/%s", name.c_str(), dir.c_str(), engineFile.c_str());
-                return nullptr;
-            }
-            LOG_DEBUG("Attempting to load %s runner from %s", name.c_str(), dir.c_str());
-            auto runner = MultimodalRunner::create(dir, mDeployment.base.maxSupportedBatchSize,
-                mDeployment.base.maxKVCacheCapacity, stream, mCheckpointDir);
-            LOG_INFO("%s runner successfully initialized", name.c_str());
-            return runner;
-        };
-
-        mAudioRunner = loadRunner(multimodalEngineDir + "/audio", "audio_encoder.engine", "Audio");
-        mVisionRunner = loadRunner(multimodalEngineDir + "/visual", "visual.engine", "Visual");
-        if (!mVisionRunner)
+        // A missing engine file means the deployment simply has no such encoder. Runners are built on
+        // first use (ensureVisionRunner/ensureAudioRunner), so a text-only session never pays for them.
+        namespace fs = std::filesystem;
+        if (fs::exists(fs::path(multimodalEngineDir) / "audio" / "audio_encoder.engine"))
         {
-            mVisionRunner = loadRunner(multimodalEngineDir, "visual.engine", "Vision");
+            mAudioEngineDir = multimodalEngineDir + "/audio";
+        }
+        if (fs::exists(fs::path(multimodalEngineDir) / "visual" / "visual.engine"))
+        {
+            mVisionEngineDir = multimodalEngineDir + "/visual";
+        }
+        else if (fs::exists(fs::path(multimodalEngineDir) / "visual.engine"))
+        {
+            mVisionEngineDir = multimodalEngineDir;
         }
 
-        // At least one multimodal runner must be available
-        ELLM_CHECK(mAudioRunner || mVisionRunner, "No valid multimodal engine found in " + multimodalEngineDir);
+        // At least one multimodal engine must be available
+        ELLM_CHECK(hasAudioEngine() || hasVisionEngine(), "No valid multimodal engine found in " + multimodalEngineDir);
 
         // Try to load action expert from multimodalEngineDir/action
         try
@@ -647,6 +656,12 @@ void LLMRankRuntime::initializeCommon(ModelArtifacts&& artifacts, std::string co
                     "Re-export and rebuild the action engine with --max_kv_cache_capacity=%d to match the LLM engine.",
                     actionMaxKVCacheCapacity, llmMaxKVCacheCapacity, llmMaxKVCacheCapacity));
         }
+    }
+
+    // The action path reads MRoPE deltas from the vision runner, so it is built eagerly there.
+    if (mActionRunner)
+    {
+        ensureVisionRunner(stream);
     }
 
     if (contextCacheConfig.enabled)
@@ -694,10 +709,9 @@ void LLMRankRuntime::initializeCommon(ModelArtifacts&& artifacts, std::string co
     int64_t const baseContextMemorySize = mBaseExecutor->getRequiredContextMemorySize();
     int64_t const strategyContextMemorySize = mDecoderRegistry ? mDecoderRegistry->getRequiredContextMemorySize() : 0;
     int64_t const visionContextMemorySize = mVisionRunner ? mVisionRunner->getRequiredContextMemorySize() : 0;
-    int64_t const audioContextMemorySize = mAudioRunner ? mAudioRunner->getRequiredContextMemorySize() : 0;
     int64_t const actionContextMemorySize = mActionRunner ? mActionRunner->getRequiredContextMemorySize() : 0;
-    int64_t const sharedContextMemorySize = std::max({baseContextMemorySize, strategyContextMemorySize,
-        visionContextMemorySize, audioContextMemorySize, actionContextMemorySize});
+    int64_t const sharedContextMemorySize = std::max(
+        {baseContextMemorySize, strategyContextMemorySize, visionContextMemorySize, actionContextMemorySize});
     mSharedExecContextMemory = rt::Tensor({sharedContextMemorySize}, rt::DeviceType::kGPU, nvinfer1::DataType::kUINT8,
         "LLMRankRuntime::mSharedExecContextMemory");
     mBaseExecutor->setContextMemory(mSharedExecContextMemory);
@@ -709,29 +723,84 @@ void LLMRankRuntime::initializeCommon(ModelArtifacts&& artifacts, std::string co
     {
         mVisionRunner->setContextMemory(mSharedExecContextMemory);
     }
-    if (mAudioRunner)
-    {
-        mAudioRunner->setContextMemory(mSharedExecContextMemory);
-    }
     if (mActionRunner)
     {
         mActionRunner->setContextMemory(mSharedExecContextMemory);
     }
     LOG_INFO(
-        "Setup shared execution context memory: %zu bytes (base requires: %zu, strategy requires: %zu, vision "
-        "requires: "
-        "%zu, audio requires: %zu, action requires: %zu)",
+        "Setup shared execution context memory: %zu bytes (base requires: %zu, strategy requires: %zu, eager "
+        "vision requires: %zu, action requires: %zu)",
         static_cast<size_t>(sharedContextMemorySize), static_cast<size_t>(baseContextMemorySize),
         static_cast<size_t>(strategyContextMemorySize), static_cast<size_t>(visionContextMemorySize),
-        static_cast<size_t>(audioContextMemorySize), static_cast<size_t>(actionContextMemorySize));
+        static_cast<size_t>(actionContextMemorySize));
 
     // Encoder embedding cache — content-addressed GPU cache for ViT/audio encoder outputs.
-    if ((mVisionRunner || mAudioRunner) && contextCacheConfig.encoderEmbeddingCacheBudgetBytes > 0)
+    if ((hasVisionEngine() || hasAudioEngine()) && contextCacheConfig.encoderEmbeddingCacheBudgetBytes > 0)
     {
         auto const budgetBytes = contextCacheConfig.encoderEmbeddingCacheBudgetBytes;
         mEncoderEmbeddingCache = std::make_unique<EncoderEmbeddingCache>(budgetBytes);
         LOG_INFO("Encoder embedding cache initialized with %zu MiB budget.",
             static_cast<size_t>(budgetBytes / (1024 * 1024)));
+    }
+}
+
+void LLMRankRuntime::bindEncoderContextMemory(MultimodalRunner& runner, cudaStream_t stream)
+{
+    if (mSharedExecContextMemory.isEmpty())
+    {
+        return; // Eager (action) path: the init sizing binds it to the shared buffer.
+    }
+    int64_t const required = runner.getRequiredContextMemorySize();
+    if (mSharedExecContextMemory.getMemoryCapacity() >= required)
+    {
+        runner.setContextMemory(mSharedExecContextMemory);
+        return;
+    }
+    // The base engines may hold CUDA graphs on the shared buffer, so it is never regrown. Encoders get
+    // their own buffer, shared by the vision and audio runners and grown only for a larger second one.
+    if (mEncoderExecContextMemory.getMemoryCapacity() < required)
+    {
+        check::check(cudaStreamSynchronize(stream) == cudaSuccess, "Encoder context stream sync failed");
+        mEncoderExecContextMemory = rt::Tensor(
+            {required}, rt::DeviceType::kGPU, nvinfer1::DataType::kUINT8, "LLMRankRuntime::mEncoderExecContextMemory");
+        for (auto* other : {mVisionRunner.get(), mAudioRunner.get()})
+        {
+            if (other != nullptr && other != &runner
+                && other->getRequiredContextMemorySize() > mSharedExecContextMemory.getMemoryCapacity())
+            {
+                other->setContextMemory(mEncoderExecContextMemory);
+            }
+        }
+    }
+    runner.setContextMemory(mEncoderExecContextMemory);
+}
+
+std::unique_ptr<MultimodalRunner> LLMRankRuntime::createEncoderRunner(
+    std::string const& dir, std::string const& engineFile, char const* name, cudaStream_t stream)
+{
+    ELLM_CHECK(std::filesystem::exists(std::filesystem::path(dir) / engineFile),
+        format::fmtstr(
+            "%s encoder engine %s/%s is missing; it was present at startup.", name, dir.c_str(), engineFile.c_str()));
+    auto runner = MultimodalRunner::create(
+        dir, mDeployment.base.maxSupportedBatchSize, mDeployment.base.maxKVCacheCapacity, stream, mCheckpointDir);
+    LOG_INFO("%s runner successfully initialized (lazy)", name);
+    bindEncoderContextMemory(*runner, stream);
+    return runner;
+}
+
+void LLMRankRuntime::ensureVisionRunner(cudaStream_t stream)
+{
+    if (mVisionRunner == nullptr && hasVisionEngine())
+    {
+        mVisionRunner = createEncoderRunner(mVisionEngineDir, "visual.engine", "Visual", stream);
+    }
+}
+
+void LLMRankRuntime::ensureAudioRunner(cudaStream_t stream)
+{
+    if (mAudioRunner == nullptr && hasAudioEngine())
+    {
+        mAudioRunner = createEncoderRunner(mAudioEngineDir, "audio_encoder.engine", "Audio", stream);
     }
 }
 
@@ -1422,8 +1491,8 @@ LLMRankRuntime::GenerationSession::AdmissionIntent LLMRankRuntime::GenerationSes
     bool const hasMedia = !item.imageBuffers.empty() || !item.audioBuffers.empty();
     if (hasMedia)
     {
-        ELLM_CHECK((item.imageBuffers.empty() || mRuntime.mVisionRunner != nullptr)
-                && (item.audioBuffers.empty() || mRuntime.mAudioRunner != nullptr),
+        ELLM_CHECK((item.imageBuffers.empty() || mRuntime.hasVisionEngine())
+                && (item.audioBuffers.empty() || mRuntime.hasAudioEngine()),
             "admitRequest: the request carries media this deployment has no encoder for.");
         // Visual-token pruning runs only in the founding prefill (it gates on an empty base KV),
         // so a media joiner would silently skip it and generate a different answer than the same
@@ -1820,8 +1889,7 @@ std::unique_ptr<LLMRankRuntime::SteppedGeneration> LLMRankRuntime::beginGenerati
         mDeployment.base.maxNumSequences, mDeployment.base.maxQueryLength, mDeployment.base.maxPhysicalTokens,
         mDeployment.base.recurrentPoolRows, /* mixedStepSupported = */ false});
     context.layerDebugger = LayerDebugger::fromEnv();
-    bool const supportsMultimodalInput
-        = (mAudioRunner != nullptr) || (mVisionRunner != nullptr) || (mActionRunner != nullptr);
+    bool const supportsMultimodalInput = hasAudioEngine() || hasVisionEngine() || (mActionRunner != nullptr);
 
     if (supportsMultimodalInput)
     {
@@ -2472,12 +2540,12 @@ bool LLMRankRuntime::validateRequestConfig(LLMGenerationRequest const& request)
             }
         }
     }
-    if (hasAudio && !mAudioRunner)
+    if (hasAudio && !hasAudioEngine())
     {
         LOG_ERROR("Request contains audio input, but this runtime does not have an audio runner.");
         return false;
     }
-    if (hasVision && !mVisionRunner)
+    if (hasVision && !hasVisionEngine())
     {
         LOG_ERROR("Request contains vision input, but this runtime does not have a vision runner.");
         return false;
@@ -2506,6 +2574,16 @@ bool LLMRankRuntime::multiModalRuntimePreprocess(LLMGenerationRequest const& req
         request.requests.begin(), request.requests.end(), [](auto const& req) { return !req.imageBuffers.empty(); });
     bool const hasTrajectoryHistory = std::any_of(request.requests.begin(), request.requests.end(),
         [](auto const& req) { return req.pastTrajectory.has_value(); });
+
+    // First media request of a kind builds its runner; later requests reuse it.
+    if (hasAudio)
+    {
+        ensureAudioRunner(stream);
+    }
+    if (hasVision)
+    {
+        ensureVisionRunner(stream);
+    }
 
     // Clear request-scoped multimodal state up front so previous requests cannot leak through reused runtime members.
     context.visualEmbeddings = std::nullopt;
@@ -3258,7 +3336,7 @@ bool LLMRankRuntime::runBaseModelPrefill(
     mEmbeddingPre->prepareDeepstack(mIdsInput, context.deepstackFeatures, *mPipelineIO, context.stream);
     if (mGemma4Ple)
     {
-        mGemma4Ple->embed(mIdsInput, context.stream);
+        mGemma4Ple->embed(mIdsInput, batch.hostTokenIds.dataPointer<int32_t>(), context.stream);
     }
 
     // Visual-token pruning compacts the assembled embeddings before the engine runs, pruning each

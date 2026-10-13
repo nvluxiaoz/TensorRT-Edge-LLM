@@ -527,8 +527,8 @@ bool DSparkDecoder::runDraftForward(DecodingInferenceContext& context)
         activeBatchSize * sizeof(int32_t), cudaMemcpyHostToDevice, context.stream));
 
     check::check(mDraftInputsEmbeds.reshape({activeBatchSize, blockLen, mDraftHiddenSize}), "Tensor reshape failed");
-    kernel::embeddingLookup(mRuntime.preprocess.idsInput, mRuntime.preprocess.embedding.table,
-        mRuntime.preprocess.embedding.scalesAsOptional(), mDraftInputsEmbeds, context.stream);
+    kernel::embeddingLookup(
+        mRuntime.preprocess.idsInput, mRuntime.preprocess.embedding.descriptor(), mDraftInputsEmbeds, context.stream);
 
     int64_t maxDeltaLen;
     int64_t sourceSeqLen;
@@ -962,8 +962,8 @@ bool DSparkDecoder::runBaseVerification(DecodingInferenceContext& context)
     check::check(mRuntime.base.pipelineIO.inputsEmbeds.reshape(
                      {activeBatchSize, verifyLen, mRuntime.deployment.base.hiddenSize}),
         "Tensor reshape failed");
-    kernel::embeddingLookup(mRuntime.preprocess.idsInput, mRuntime.preprocess.embedding.table,
-        mRuntime.preprocess.embedding.scalesAsOptional(), mRuntime.base.pipelineIO.inputsEmbeds, context.stream);
+    kernel::embeddingLookup(mRuntime.preprocess.idsInput, mRuntime.preprocess.embedding.descriptor(),
+        mRuntime.base.pipelineIO.inputsEmbeds, context.stream);
 
     int32_t const selectTokenSize = activeBatchSize * verifyLen;
     check::check(
@@ -1467,8 +1467,8 @@ bool DSparkDecoder::runSystemPromptPrefill(DecodingInferenceContext& context)
         activeBatchSize * blockLen * sizeof(int32_t), cudaMemcpyHostToDevice, context.stream));
 
     check::check(mDraftInputsEmbeds.reshape({activeBatchSize, blockLen, mDraftHiddenSize}), "Tensor reshape failed");
-    kernel::embeddingLookup(mRuntime.preprocess.idsInput, mRuntime.preprocess.embedding.table,
-        mRuntime.preprocess.embedding.scalesAsOptional(), mDraftInputsEmbeds, context.stream);
+    kernel::embeddingLookup(
+        mRuntime.preprocess.idsInput, mRuntime.preprocess.embedding.descriptor(), mDraftInputsEmbeds, context.stream);
 
     check::check(
         mDraftTargetHidden.reshape({activeBatchSize, prefillLen, mBaseOutputHiddenDim}), "Tensor reshape failed");

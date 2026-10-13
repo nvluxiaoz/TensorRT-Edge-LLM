@@ -27,15 +27,20 @@
 
 #include "runtime/weight/checkpointReader.h"
 
+#include "common/bindingNames.h"
 #include "common/checkMacros.h"
 #include "common/safetensorsUtils.h"
 #include "common/tensor.h"
+#include "runtime/preprocess/gemma4EmbeddingPreprocessor.h"
 #include "scratchDir.h"
 
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <gtest/gtest.h>
 #include <nlohmann/json.hpp>
 
+#include <cstring>
 #include <fstream>
 #include <numeric>
 #include <unistd.h>
@@ -580,6 +585,95 @@ TEST_F(CheckpointReaderTest, ExplicitLocationRejectsConflictingDefinitionsOfOneT
     EXPECT_NO_THROW(CheckpointReader(mDir,
         {makeLocation("dup", "archive.bin", 0, Coords({4}), 16),
             makeLocation("dup", "archive.bin", 0, Coords({4}), 16)}));
+}
+
+// ---------------------------------------------------------------------------
+// Cached PLE rows read from a located tensor
+// ---------------------------------------------------------------------------
+
+std::vector<uint16_t> deviceHalves(Tensor const& tensor, cudaStream_t stream)
+{
+    std::vector<uint16_t> values(static_cast<size_t>(tensor.getShape().volume()));
+    CUDA_CHECK(cudaMemcpyAsync(
+        values.data(), tensor.rawPointer(), values.size() * sizeof(uint16_t), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    return values;
+}
+
+// Given a BF16 PLE tensor behind another tensor in a checkpoint shard
+// When it is located and gathered in cached residency with the checkpoint scale
+// Then locate() reports the payload byte range, every PLE output equals the resident gather of the scaled FP16
+// table (duplicates, out-of-range and image tokens included), and a truncated file fails the read
+TEST_F(CheckpointReaderTest, CachedPleRowsFromLocatedTensorMatchResidentTable)
+{
+    constexpr int32_t kVocab{9};
+    constexpr int32_t kLayers{2};
+    constexpr int32_t kHidden{16};
+    constexpr int32_t kCols{kLayers * kHidden};
+    constexpr int32_t kImageTokenId{7};
+    constexpr int32_t kMaxTokens{12};
+    constexpr float kScale{16.0F};
+    std::string const name{"model.embed_tokens_per_layer.weight"};
+
+    std::vector<Tensor> shard;
+    shard.emplace_back(Coords({3}), DeviceType::kCPU, nvinfer1::DataType::kFLOAT, "a.filler");
+    shard.emplace_back(Coords({kVocab, kCols}), DeviceType::kCPU, nvinfer1::DataType::kBF16, name);
+    auto* bf16Rows = static_cast<__nv_bfloat16*>(shard.back().rawPointer());
+    std::vector<half> scaled(static_cast<size_t>(kVocab) * kCols);
+    for (size_t idx = 0; idx < scaled.size(); ++idx)
+    {
+        bf16Rows[idx] = __float2bfloat16(0.37F * static_cast<float>(idx % 29) - 4.1F);
+        scaled[idx] = __float2half(__bfloat162float(bf16Rows[idx]) * kScale);
+    }
+    ASSERT_TRUE(safetensors::saveSafetensors(mDir / kShardA, shard, mStream));
+
+    CheckpointReader reader(mDir);
+    TensorLocation const location = reader.locate(name);
+    EXPECT_EQ(location.file, mDir / kShardA);
+    EXPECT_EQ(location.dtype, "BF16");
+    EXPECT_EQ(location.shape, Coords({kVocab, kCols}));
+    ASSERT_EQ(location.bytes, scaled.size() * sizeof(__nv_bfloat16));
+    std::vector<char> payload(location.bytes);
+    std::ifstream file(location.file, std::ios::binary);
+    file.seekg(static_cast<std::streamoff>(location.offset));
+    file.read(payload.data(), static_cast<std::streamsize>(payload.size()));
+    EXPECT_EQ(std::memcmp(payload.data(), bf16Rows, payload.size()), 0);
+    EXPECT_THROW(static_cast<void>(reader.locate("absent")), std::runtime_error);
+
+    Tensor residentTable(Coords({kVocab, kCols}), DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    CUDA_CHECK(cudaMemcpyAsync(
+        residentTable.rawPointer(), scaled.data(), scaled.size() * sizeof(half), cudaMemcpyHostToDevice, mStream));
+    LLMEngineConfig config;
+    config.pleEnabled = true;
+    config.numPleInputs = kLayers;
+    config.pleHiddenSize = kHidden;
+    config.imageTokenId = kImageTokenId;
+    TensorMap residentMap;
+    TensorMap cachedMap;
+    Gemma4EmbeddingPreprocessor resident(mDir, config, 1, kMaxTokens, residentMap, mStream, std::move(residentTable));
+    PleFileSource const source{location.name, location.file, static_cast<int64_t>(location.offset),
+        nvinfer1::DataType::kBF16, kVocab, kCols, kScale};
+    Gemma4EmbeddingPreprocessor cached(mDir, config, 1, kMaxTokens, cachedMap, mStream, std::nullopt,
+        PleRuntimeConfig{PleResidency::kCACHED, ""}, source);
+
+    std::vector<int32_t> const hostIds{4, 2, 4, -1, kVocab, kImageTokenId, 8, 2, 0, 4};
+    Tensor ids(Coords({1, static_cast<int64_t>(hostIds.size())}), DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    CUDA_CHECK(cudaMemcpyAsync(
+        ids.rawPointer(), hostIds.data(), hostIds.size() * sizeof(int32_t), cudaMemcpyHostToDevice, mStream));
+    resident.embed(ids, mStream);
+    cached.embed(ids, hostIds.data(), mStream);
+    for (int32_t layer = 0; layer < kLayers; ++layer)
+    {
+        std::string const output = binding_names::formatPleTokenEmbedsName(layer);
+        ASSERT_EQ(cachedMap.get(output)->getShape(), Coords({static_cast<int64_t>(hostIds.size()), kHidden}));
+        EXPECT_EQ(deviceHalves(*cachedMap.get(output), mStream), deviceHalves(*residentMap.get(output), mStream))
+            << "layer=" << layer;
+    }
+
+    std::filesystem::resize_file(location.file, location.offset + 3 * kCols * sizeof(__nv_bfloat16));
+    std::vector<int32_t> const truncatedRow{8};
+    Tensor truncatedIds(Coords({1, 1}), DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    EXPECT_THROW(cached.embed(truncatedIds, truncatedRow.data(), mStream), std::runtime_error);
 }
 
 } // namespace

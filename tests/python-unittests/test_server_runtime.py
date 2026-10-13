@@ -734,7 +734,7 @@ def test_runtime_load_forwards_context_cache_config(monkeypatch, engine_type):
 
     class Runtime:
 
-        def __init__(self, *args):
+        def __init__(self, *args, **kwargs):
             captured["args"] = args
 
         @staticmethod
@@ -767,6 +767,41 @@ def test_runtime_load_forwards_context_cache_config(monkeypatch, engine_type):
     assert native.max_records == 23
     if engine_type == EngineType.SPEC_DECODE:
         assert captured["args"][-1] == 0
+
+
+def test_runtime_load_forwards_ple_options(monkeypatch):
+    from experimental.server.runtime import engine as engine_module
+
+    captured = {}
+
+    class Runtime:
+
+        def __init__(self, *args, **kwargs):
+            captured.update(kwargs)
+
+        @staticmethod
+        def capture_decoding_cuda_graph():
+            return True
+
+    monkeypatch.setattr(
+        engine_module, "_import_runtime",
+        lambda: SimpleNamespace(ContextCacheConfig=lambda: SimpleNamespace(),
+                                LLMRuntime=Runtime))
+    llm = LLM.__new__(LLM)
+    llm._layout = SimpleNamespace(engine_type=EngineType.LLM, has_speech=False)
+    llm._bundle_dir = "/bundle"
+    llm._media_dir = ""
+    llm._model_dir = "/model"
+    llm._context_cache_config = ContextCacheConfig()
+    llm._ple_residency = "cached"
+    llm._ple_file = "/data/ple.safetensors"
+
+    llm._load_runtime()
+
+    assert captured == {
+        "ple_residency": "cached",
+        "ple_file": "/data/ple.safetensors"
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1057,7 +1092,7 @@ def test_runtime_load_refuses_ifb_for_an_unsupported_deployment(
 
     class Runtime:
 
-        def __init__(self, *args):
+        def __init__(self, *args, **kwargs):
             raise AssertionError("no runtime may be built before the check")
 
     monkeypatch.setattr(

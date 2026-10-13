@@ -35,6 +35,10 @@ _DEFAULT_ENGINE_CACHE_MAX_BYTES = 50 * (1 << 30)
 _CHECKPOINT_SUFFIXES = (".bin", ".json", ".model", ".pt", ".pth",
                         ".safetensors")
 _CONTENT_SAMPLE_BYTES = 64
+# FP16 table precisions stay out of the profile key so existing bundles keep
+# their cache path.
+_TABLE_PRECISION_FIELDS = ("embedding_quantization", "ple_quantization",
+                           "lm_head_quantization")
 
 logger = logging.getLogger("edgellm.server")
 
@@ -55,6 +59,9 @@ class BuildOptions:
     tp_size: Optional[int] = None
     plugin_path: str = ""
     tree_base: bool = False
+    embedding_quantization: str = "fp16"
+    ple_quantization: str = "fp16"
+    lm_head_quantization: str = "fp16"
 
     @property
     def builder_spec_type(self) -> str:
@@ -81,6 +88,13 @@ class BuildOptions:
             argv += ["--plugin-path", self.plugin_path]
         if self.tree_base:
             argv.append("--tree-base")
+        for flag, value in (
+            ("--embedding-quantization", self.embedding_quantization),
+            ("--ple-quantization", self.ple_quantization),
+            ("--lm-head-quantization", self.lm_head_quantization),
+        ):
+            if value != "fp16":
+                argv += [flag, value]
         for flag, value in (
             ("--max-input-len", self.max_input_len),
             ("--max-kv-cache-capacity", self.max_kv_cache_capacity),
@@ -210,11 +224,15 @@ def bundle_cache_path(model_dir: str, cache_dir: str,
         **{
             field.name: getattr(options, field.name)
             for field in fields(options) if field.name not in {
-                "draft_model_dir", "plugin_path"
+                "draft_model_dir", "plugin_path", *_TABLE_PRECISION_FIELDS
             }
         },
         "builder_spec_type": options.builder_spec_type,
     }
+    profile.update({
+        name: getattr(options, name)
+        for name in _TABLE_PRECISION_FIELDS if getattr(options, name) != "fp16"
+    })
     profile_digest = hashlib.sha256(
         json.dumps(profile, sort_keys=True).encode("utf-8")).hexdigest()[:12]
     profile_name = (f"i{options.max_input_len or 'default'}-"

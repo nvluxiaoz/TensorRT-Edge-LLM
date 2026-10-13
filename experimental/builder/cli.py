@@ -23,6 +23,8 @@ from typing import Iterable, Optional, Sequence, Tuple, Union
 from tensorrt_edgellm._native import NativeManifestNotFoundError
 from tensorrt_edgellm._native.dependencies import require_tensorrt
 from tensorrt_edgellm._native.load import resolve_payload
+from tensorrt_edgellm.checkpoint.embedding_quantization import \
+    EMBEDDING_FORMATS
 from tensorrt_edgellm.dflash import DFlashVersion, resolve_dflash_contract
 
 LOGGER = logging.getLogger("experimental.builder")
@@ -30,6 +32,16 @@ LOGGER = logging.getLogger("experimental.builder")
 
 def _value_or_default(value, default):
     return default if value is None else value
+
+
+def _embedding_quantization(args: argparse.Namespace) -> str:
+    if not args.fp8_embedding:
+        return args.embedding_quantization
+    if args.embedding_quantization not in ("fp16", "fp8"):
+        raise ValueError(
+            "--fp8-embedding conflicts with "
+            f"--embedding-quantization {args.embedding_quantization}")
+    return "fp8"
 
 
 def _build_args(args: argparse.Namespace, component: str):
@@ -64,7 +76,9 @@ def _build_args(args: argparse.Namespace, component: str):
         draft_reduced_vocab_dir=args.draft_reduced_vocab_dir or "",
         draft_model_dir=args.draft_model_dir or "",
         target_model_dir=args.target_model_dir or "",
-        fp8_embedding=args.fp8_embedding,
+        embedding_quantization=_embedding_quantization(args),
+        ple_quantization=args.ple_quantization,
+        lm_head_quantization=args.lm_head_quantization,
         plugin_path=args.plugin_path,
         profiling_detailed=args.profiling_detailed,
         dense_quant=args.dense,
@@ -343,7 +357,27 @@ def _add_build_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--reduced-vocab-dir")
     parser.add_argument("--draft-reduced-vocab-dir")
     parser.add_argument("--draft-model-dir")
-    parser.add_argument("--fp8-embedding", action="store_true")
+    parser.add_argument(
+        "--embedding-quantization",
+        choices=EMBEDDING_FORMATS,
+        default="fp16",
+        help=("Write embedding.safetensors in this format instead of reading "
+              "the FP16 table from the checkpoint at runtime."))
+    parser.add_argument("--fp8-embedding",
+                        action="store_true",
+                        help="Alias for --embedding-quantization fp8.")
+    parser.add_argument(
+        "--ple-quantization",
+        choices=EMBEDDING_FORMATS,
+        default="fp16",
+        help=("Gemma 4 per-layer embedding format. Non-FP16 formats write "
+              "ple_embedding.safetensors instead of reading the checkpoint."))
+    parser.add_argument(
+        "--lm-head-quantization",
+        choices=("fp16", "int4"),
+        default="fp16",
+        help=("int4 quantizes a tied embedding head into the engine "
+              "(symmetric, group 128) for the INT4 GEMM plugin."))
     parser.add_argument(
         "--externalize-weights",
         action="append",

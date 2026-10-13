@@ -132,7 +132,7 @@ supports in a single command. By default it runs every stage; pass
 | Flag | Description |
 |------|-------------|
 | `--components LIST` | Comma-separated allow-list (`thinker,talker,code_predictor,visual,audio,code2wav,action`). Default: export every component the checkpoint supports. |
-| `--fp8-embedding` | Write `embedding.safetensors` in FP8 E4M3 (Thinker only). |
+| `--embedding-quantization FORMAT` | Write `embedding.safetensors` as `fp8`, `int8`, `int4`, or `nvfp4` (Thinker only; `--fp8-embedding` = `fp8`). |
 | `--reduced-vocab-dir DIR` | Use `vocab_map.safetensors` to shrink the LM head vocabulary. |
 | `--skip-llm`, `--skip-visual`, `--skip-audio`, `--skip-code2wav` | Negative filters: skip these components entirely (applied on top of `--components`). |
 

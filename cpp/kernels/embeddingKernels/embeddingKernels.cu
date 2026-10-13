@@ -19,10 +19,12 @@
 #include "common/stringUtils.h"
 #include "embeddingKernels.h"
 #include "kernels/common/vectorizedTypes.cuh"
+#include <cmath>
 #include <cub/block/block_scan.cuh>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <limits>
+#include <type_traits>
 #if SUPPORTS_FP8
 #include <cuda_fp8.h>
 #endif
@@ -35,45 +37,268 @@ namespace kernel
 namespace
 {
 
-//! \brief FP16 embedding loader for template-based kernel
-struct Fp16EmbeddingLoader
+enum class TableFormat
 {
-    static constexpr uint32_t vecSize = DVec<half>::vec_size;
-    half const* table{nullptr};
-
-    __device__ __forceinline__ void load(int32_t tokenId, int64_t hiddenSize, uint32_t offset, DVec<half>& out) const
-    {
-        out.load(table + static_cast<int64_t>(tokenId) * hiddenSize + offset);
-    }
+    kFP16,
+    kBF16,
+    kFP8,
+    kINT8,
+    kINT4,
+    kNVFP4,
 };
 
-#if SUPPORTS_FP8
-//! \brief FP8 embedding loader with per-group dequantization
-struct Fp8EmbeddingLoader
+//! Each thread decodes one 16-byte load of packed elements per step.
+constexpr int64_t kLoadBytes = 16;
+//! Elements per output vector store; scale groups are a multiple of this.
+constexpr int64_t kStoreElems = DVec<half>::vec_size;
+constexpr int32_t kInt4ZeroPoint = 8;
+constexpr uint32_t kNibbleBits = 4;
+constexpr uint32_t kNibbleMask = 0xFU;
+constexpr int64_t kGatherWarpSize = 32;
+constexpr int64_t kLookupWarpsPerBlock = 4;
+constexpr int64_t kPleGatherThreads = 256;
+
+template <TableFormat F>
+constexpr int64_t kBitsPerElement = (F == TableFormat::kFP16 || F == TableFormat::kBF16) ? 16
+    : (F == TableFormat::kFP8 || F == TableFormat::kINT8)                                ? 8
+                                                                                         : 4;
+
+template <TableFormat F>
+constexpr int64_t kChunkElems = kLoadBytes * 8 / kBitsPerElement<F>;
+
+//! Validated device view of an EmbeddingTableDescriptor; cols is the logical row width.
+struct TableView
 {
-    static constexpr uint32_t vecSize = DVec<__nv_fp8_e4m3>::vec_size;
-    __nv_fp8_e4m3 const* table{nullptr};
-    float const* scales{nullptr};
-    int64_t blockSize{0};
-    int64_t nGroups{0};
+    TableFormat format{TableFormat::kFP16};
+    uint8_t const* data{nullptr};
+    void const* scale{nullptr};
+    int64_t rows{0};
+    int64_t cols{0};
+    int64_t rowBytes{0};
+    int64_t group{0};
+    int64_t groupsPerRow{0};
+    float multiplier{1.0F};
+};
 
-    __device__ __forceinline__ void load(int32_t tokenId, int64_t hiddenSize, uint32_t offset, DVec<half>& out) const
+template <typename Fn>
+void dispatchFormat(TableFormat format, Fn&& fn)
+{
+    switch (format)
     {
-        // Determine which scale group this offset belongs to
-        int64_t const group = static_cast<int64_t>(offset) / blockSize;
-        float const scale = scales[static_cast<int64_t>(tokenId) * nGroups + group];
+    case TableFormat::kFP16: fn(std::integral_constant<TableFormat, TableFormat::kFP16>{}); break;
+    case TableFormat::kBF16: fn(std::integral_constant<TableFormat, TableFormat::kBF16>{}); break;
+    case TableFormat::kFP8: fn(std::integral_constant<TableFormat, TableFormat::kFP8>{}); break;
+    case TableFormat::kINT8: fn(std::integral_constant<TableFormat, TableFormat::kINT8>{}); break;
+    case TableFormat::kINT4: fn(std::integral_constant<TableFormat, TableFormat::kINT4>{}); break;
+    case TableFormat::kNVFP4: fn(std::integral_constant<TableFormat, TableFormat::kNVFP4>{}); break;
+    }
+}
 
-        // Load FP8 values and dequantize to FP16
-        DVec<__nv_fp8_e4m3> in;
-        in.load(table + static_cast<int64_t>(tokenId) * hiddenSize + offset);
-#pragma unroll
-        for (uint32_t i = 0; i < vecSize; ++i)
+int64_t chunkElems(TableFormat format)
+{
+    int64_t elems{0};
+    dispatchFormat(format, [&](auto tag) { elems = kChunkElems<decltype(tag)::value>; });
+    return elems;
+}
+
+TableView makeTableView(EmbeddingTableDescriptor const& table)
+{
+    rt::Tensor const& data = table.data;
+    auto const shape = data.getShape();
+    nvinfer1::DataType const dataType = data.getDataType();
+    check::check(shape.getNumDims() == 2,
+        format::fmtstr("embedding table must be 2D [rows, cols], got %s", shape.formatString().c_str()));
+    check::check(std::isfinite(table.multiplier), "embedding table multiplier must be finite");
+
+    TableView view;
+    view.data = static_cast<uint8_t const*>(data.rawPointer());
+    view.rows = shape[0];
+    view.rowBytes = shape[1] * static_cast<int64_t>(rt::utils::getTypeSize(dataType));
+    view.cols = shape[1];
+    view.multiplier = table.multiplier;
+    if (!table.scale.has_value())
+    {
+        check::check(dataType == nvinfer1::DataType::kHALF || dataType == nvinfer1::DataType::kBF16,
+            format::fmtstr(
+                "embedding table without scales must be FP16 or BF16, got dtype %d", static_cast<int32_t>(dataType)));
+        view.format = dataType == nvinfer1::DataType::kHALF ? TableFormat::kFP16 : TableFormat::kBF16;
+    }
+    else
+    {
+        rt::Tensor const& scale = table.scale->get();
+        nvinfer1::DataType const scaleType = scale.getDataType();
+        auto const scaleShape = scale.getShape();
+        if (dataType == nvinfer1::DataType::kUINT8)
         {
-            out[i] = __float2half(static_cast<float>(in[i]) * scale);
+            view.format = scaleType == nvinfer1::DataType::kFP8 ? TableFormat::kNVFP4 : TableFormat::kINT4;
+            view.cols = shape[1] * 2;
+        }
+        else
+        {
+            check::check(dataType == nvinfer1::DataType::kFP8 || dataType == nvinfer1::DataType::kINT8,
+                format::fmtstr(
+                    "scaled embedding table must be FP8, INT8 or UINT8, got dtype %d", static_cast<int32_t>(dataType)));
+            view.format = dataType == nvinfer1::DataType::kFP8 ? TableFormat::kFP8 : TableFormat::kINT8;
+        }
+        check::check(
+            scaleType == (view.format == TableFormat::kNVFP4 ? nvinfer1::DataType::kFP8 : nvinfer1::DataType::kFLOAT),
+            format::fmtstr("embedding scale dtype %d does not match the table dtype %d",
+                static_cast<int32_t>(scaleType), static_cast<int32_t>(dataType)));
+        check::check(scaleShape.getNumDims() == 2 && scaleShape[0] == view.rows && scaleShape[1] > 0
+                && view.cols % scaleShape[1] == 0,
+            format::fmtstr("embedding scale shape %s does not divide table [%ld, %ld] into row groups",
+                scaleShape.formatString().c_str(), view.rows, view.cols));
+        view.scale = scale.rawPointer();
+        view.groupsPerRow = scaleShape[1];
+        view.group = view.cols / view.groupsPerRow;
+        check::check(view.group % kStoreElems == 0,
+            format::fmtstr("embedding scale group %ld must be a multiple of %ld", view.group, kStoreElems));
+    }
+#if !SUPPORTS_FP8
+    check::check(view.format != TableFormat::kFP8 && view.format != TableFormat::kNVFP4,
+        "FP8 and NVFP4 embedding tables require a build with FP8 support (SUPPORTS_FP8=0)");
+#endif
+    int64_t const elems = chunkElems(view.format);
+    check::check(view.cols % elems == 0,
+        format::fmtstr("embedding table width %ld must be a multiple of %ld for vectorized access", view.cols, elems));
+    return view;
+}
+
+__device__ __forceinline__ float decodeE2m1(uint32_t nibble)
+{
+    // E2M1 magnitudes {0, 0.5, 1, 1.5, 2, 3, 4, 6}: codes >= 2 map to FP32 by shifting exponent and mantissa.
+    uint32_t const magnitude = nibble & 0x7U;
+    float const value = magnitude == 0U ? 0.0F
+        : magnitude == 1U               ? 0.5F
+                                        : __uint_as_float(0x3F000000U + (magnitude << 22U));
+    return (nibble & 0x8U) != 0U ? -value : value;
+}
+
+template <TableFormat F>
+__device__ __forceinline__ float decodeElement(uint8_t const* bytes, uint32_t idx)
+{
+    if constexpr (F == TableFormat::kFP16)
+    {
+        return __half2float(reinterpret_cast<half const*>(bytes)[idx]);
+    }
+    else if constexpr (F == TableFormat::kBF16)
+    {
+        return __bfloat162float(reinterpret_cast<__nv_bfloat16 const*>(bytes)[idx]);
+    }
+    else if constexpr (F == TableFormat::kINT8)
+    {
+        return static_cast<float>(reinterpret_cast<int8_t const*>(bytes)[idx]);
+    }
+    else if constexpr (F == TableFormat::kFP8)
+    {
+#if SUPPORTS_FP8
+        return static_cast<float>(reinterpret_cast<__nv_fp8_e4m3 const*>(bytes)[idx]);
+#else
+        return 0.0F;
+#endif
+    }
+    else
+    {
+        uint32_t const nibble = (bytes[idx / 2] >> ((idx % 2) * kNibbleBits)) & kNibbleMask;
+        if constexpr (F == TableFormat::kINT4)
+        {
+            return static_cast<float>(static_cast<int32_t>(nibble) - kInt4ZeroPoint);
+        }
+        else
+        {
+            return decodeE2m1(nibble);
         }
     }
-};
+}
+
+//! Scale times multiplier for the group holding `col`.
+template <TableFormat F>
+__device__ __forceinline__ float groupScale(TableView const& table, int64_t row, int64_t col)
+{
+    if constexpr (F == TableFormat::kFP16 || F == TableFormat::kBF16)
+    {
+        return table.multiplier;
+    }
+    else
+    {
+        int64_t const idx = row * table.groupsPerRow + col / table.group;
+        if constexpr (F == TableFormat::kNVFP4)
+        {
+#if SUPPORTS_FP8
+            return static_cast<float>(static_cast<__nv_fp8_e4m3 const*>(table.scale)[idx]) * table.multiplier;
+#else
+            return 0.0F;
 #endif
+        }
+        else
+        {
+            return static_cast<float const*>(table.scale)[idx] * table.multiplier;
+        }
+    }
+}
+
+//! Decode kChunkElems<F> consecutive elements of one row starting at `col` from a single 16-byte load.
+template <TableFormat F>
+__device__ __forceinline__ void loadChunk(
+    TableView const& table, int64_t row, int64_t col, float (&values)[kChunkElems<F>])
+{
+    uint4 const packed
+        = *reinterpret_cast<uint4 const*>(table.data + row * table.rowBytes + col * kBitsPerElement<F> / 8);
+    uint8_t const* bytes = reinterpret_cast<uint8_t const*>(&packed);
+#pragma unroll
+    for (uint32_t base = 0; base < kChunkElems<F>; base += kStoreElems)
+    {
+        float const scale = groupScale<F>(table, row, col + base);
+#pragma unroll
+        for (uint32_t i = 0; i < kStoreElems; ++i)
+        {
+            values[base + i] = decodeElement<F>(bytes, base + i) * scale;
+        }
+    }
+}
+
+template <typename T>
+__device__ __forceinline__ T fromFloat(float value);
+
+template <>
+__device__ __forceinline__ half fromFloat<half>(float value)
+{
+    return __float2half(value);
+}
+
+template <>
+__device__ __forceinline__ __nv_bfloat16 fromFloat<__nv_bfloat16>(float value)
+{
+    return __float2bfloat16(value);
+}
+
+template <typename T, int64_t N>
+__device__ __forceinline__ void storeChunk(float const (&values)[N], T* dst)
+{
+#pragma unroll
+    for (uint32_t base = 0; base < N; base += kStoreElems)
+    {
+        DVec<T> out;
+#pragma unroll
+        for (uint32_t i = 0; i < kStoreElems; ++i)
+        {
+            out[i] = fromFloat<T>(values[base + i]);
+        }
+        out.store(dst + base);
+    }
+}
+
+template <typename T, int64_t N>
+__device__ __forceinline__ void zeroChunk(T* dst)
+{
+#pragma unroll
+    for (uint32_t base = 0; base < N; base += kStoreElems)
+    {
+        DVec<T> out;
+        out.data = make_uint4(0U, 0U, 0U, 0U);
+        out.store(dst + base);
+    }
+}
 
 // CUDA kernel for assembling deepstack embeddings (FP16 only)
 // Extracts image-token embeddings from deepstack features. Positions whose token id == imageTokenId
@@ -150,179 +375,99 @@ __global__ void assembleDeepstackEmbeddingKernel(int32_t const* inputIds, half c
     }
 }
 
-//! \brief Template-based embedding lookup kernel (text + optional image/audio)
-//! Text tokens use the template loader (FP16 or FP8), image/audio tokens use FP16 embeds
-//! \tparam TLoader Embedding loader type (Fp16EmbeddingLoader or Fp8EmbeddingLoader)
-template <typename TLoader>
-__global__ void embeddingLookupKernelImpl(int32_t const* inputIds, TLoader loader, int32_t const* multimodalIndices,
+//! \brief Embedding lookup kernel (text + optional image/audio); one warp per token.
+//! Text tokens are decoded from the table, image/audio tokens copy FP16 embeds.
+template <TableFormat F>
+__global__ void embeddingLookupKernelImpl(int32_t const* inputIds, TableView table, int32_t const* multimodalIndices,
     int32_t imageTokenId, half const* imageEmbeds, int64_t imageTokenLen, int32_t audioTokenId, half const* audioEmbeds,
-    int64_t audioTokenLen, half* output, int64_t batchSize, int64_t seqLen, int32_t vocabSize, int64_t hiddenSize)
+    int64_t audioTokenLen, half* output, int64_t numTokens)
 {
-    // Each warp handles one hidden state (one token's embedding)
-    constexpr uint32_t vecSize = TLoader::vecSize;
-    constexpr uint32_t warpSize = 32;
-
-    // Use 2D CTA: (32, 4) - warp index directly from blockIdx.x * blockDim.y + threadIdx.y
-    uint32_t const warpId = blockIdx.x * blockDim.y + threadIdx.y;
-    uint32_t const laneId = threadIdx.x;
-
-    if (warpId >= batchSize * seqLen)
+    constexpr int64_t kElems = kChunkElems<F>;
+    int64_t const tokenIdx = static_cast<int64_t>(blockIdx.x) * blockDim.y + threadIdx.y;
+    int64_t const laneId = threadIdx.x;
+    if (tokenIdx >= numTokens)
     {
         return;
     }
 
-    // Calculate token indices
-    uint32_t const batchIdx = warpId / seqLen;
-    uint32_t const tokenIdx = warpId % seqLen;
-    uint32_t const linearIdx = batchIdx * seqLen + tokenIdx;
-
-    // Get token ID
-    int32_t const tokenId = inputIds[linearIdx];
-
-    // Determine token type
-    bool isImageToken = (imageEmbeds != nullptr && tokenId == imageTokenId);
-    bool isAudioToken = (audioEmbeds != nullptr && tokenId == audioTokenId);
+    int32_t const tokenId = inputIds[tokenIdx];
+    int64_t const hiddenSize = table.cols;
+    half const* mediaRow = nullptr;
     bool isValidTextToken = false;
-    bool isValidImageToken = false;
-    bool isValidAudioToken = false;
-    int32_t multimodalIdx = 0;
-
-    if (isImageToken)
+    if (imageEmbeds != nullptr && tokenId == imageTokenId)
     {
-        multimodalIdx = multimodalIndices[linearIdx];
-        isValidImageToken = (multimodalIdx >= 0 && multimodalIdx < imageTokenLen);
+        int32_t const multimodalIdx = multimodalIndices[tokenIdx];
+        mediaRow
+            = multimodalIdx >= 0 && multimodalIdx < imageTokenLen ? imageEmbeds + multimodalIdx * hiddenSize : nullptr;
     }
-    else if (isAudioToken)
+    else if (audioEmbeds != nullptr && tokenId == audioTokenId)
     {
-        multimodalIdx = multimodalIndices[linearIdx];
-        isValidAudioToken = (multimodalIdx >= 0 && multimodalIdx < audioTokenLen);
+        int32_t const multimodalIdx = multimodalIndices[tokenIdx];
+        mediaRow
+            = multimodalIdx >= 0 && multimodalIdx < audioTokenLen ? audioEmbeds + multimodalIdx * hiddenSize : nullptr;
     }
     else
     {
-        isValidTextToken = (tokenId >= 0 && tokenId < vocabSize);
+        isValidTextToken = tokenId >= 0 && tokenId < table.rows;
     }
 
-    uint32_t const baseOutputIdx = warpId * hiddenSize;
-
-    // Each thread processes vecSize elements, loop until we cover the entire hidden state
-    for (uint32_t offset = laneId * vecSize; offset < hiddenSize; offset += warpSize * vecSize)
+    for (int64_t col = laneId * kElems; col < hiddenSize; col += kGatherWarpSize * kElems)
     {
-        DVec<half> embeddingVec;
-
+        half* dst = output + tokenIdx * hiddenSize + col;
         if (isValidTextToken)
         {
-            // Use template loader for text tokens (supports FP16 or FP8)
-            loader.load(tokenId, hiddenSize, offset, embeddingVec);
+            float values[kElems];
+            loadChunk<F>(table, tokenId, col, values);
+            storeChunk(values, dst);
         }
-        else if (isValidImageToken)
+        else if (mediaRow != nullptr)
         {
-            // Load from FP16 imageEmbeds directly
-            uint32_t const embeddingOffset = multimodalIdx * hiddenSize + offset;
-            embeddingVec.load(imageEmbeds + embeddingOffset);
-        }
-        else if (isValidAudioToken)
-        {
-            // Load from FP16 audioEmbeds directly
-            uint32_t const embeddingOffset = multimodalIdx * hiddenSize + offset;
-            embeddingVec.load(audioEmbeds + embeddingOffset);
+#pragma unroll
+            for (int64_t base = 0; base < kElems; base += kStoreElems)
+            {
+                DVec<half> media;
+                media.load(mediaRow + col + base);
+                media.store(dst + base);
+            }
         }
         else
         {
-            // Use zero embedding for out-of-bounds tokens
-#pragma unroll
-            for (uint32_t i = 0; i < vecSize; ++i)
-            {
-                embeddingVec[i] = __float2half(0.0f);
-            }
+            zeroChunk<half, kElems>(dst);
         }
-
-        // Store to output
-        uint32_t const outputIdx = baseOutputIdx + offset;
-        embeddingVec.store(output + outputIdx);
     }
 }
 
-// Template helper function to launch multimodal embedding lookup kernel
-template <typename TLoader>
-void launchEmbeddingLookupKernel(int32_t const* inputIds, TLoader const& loader, int32_t const* multimodalIndices,
-    int32_t imageTokenId, half const* imageEmbeds, int64_t imageTokenLen, int32_t audioTokenId, half const* audioEmbeds,
-    int64_t audioTokenLen, half* output, int64_t batchSize, int64_t seqLen, int32_t vocabSize, int64_t hiddenSize,
-    cudaStream_t stream)
+//! \brief Gemma4 PLE gather; one block per token decodes the token's whole [numLayers * pleHiddenSize] row
+//! and writes each layer slice to its layer-major output. A non-null rowIndex selects the table row per token.
+template <TableFormat F, typename T>
+__global__ void gemma4PleGatherKernel(int32_t const* inputIds, int32_t const* rowIndex, TableView table,
+    T* outputBuffer, int64_t layerOutputCapacity, int32_t pleHiddenSize, int32_t imageTokenId, int32_t audioTokenId)
 {
-    constexpr uint32_t vecSize = TLoader::vecSize;
-    uint32_t const totalTokens = batchSize * seqLen;
+    constexpr int64_t kElems = kChunkElems<F>;
+    int64_t const tokenOffset = blockIdx.x;
+    int32_t const tokenId = inputIds[tokenOffset];
+    int32_t const row = rowIndex == nullptr ? tokenId : rowIndex[tokenOffset];
+    bool const zeroFill = row < 0 || row >= table.rows || (imageTokenId >= 0 && tokenId == imageTokenId)
+        || (audioTokenId >= 0 && tokenId == audioTokenId);
 
-    // Validate that hiddenSize is a multiple of vecSize to avoid partial loads
-    check::check(hiddenSize % vecSize == 0,
-        format::fmtstr("hiddenSize must be a multiple of %d for efficient vectorized access", vecSize));
-
-    // Use 2D CTA: (32, 4) - 4 warps per block
-    dim3 const threadsPerBlock(32, 4);               // (32, 4) = 128 threads total
-    uint32_t const gridSize = (totalTokens + 3) / 4; // 4 warps per block
-
-    embeddingLookupKernelImpl<<<gridSize, threadsPerBlock, 0, stream>>>(inputIds, loader, multimodalIndices,
-        imageTokenId, imageEmbeds, imageTokenLen, audioTokenId, audioEmbeds, audioTokenLen, output, batchSize, seqLen,
-        vocabSize, hiddenSize);
+    for (int64_t col = threadIdx.x * kElems; col < table.cols; col += blockDim.x * kElems)
+    {
+        int64_t const layerIdx = col / pleHiddenSize;
+        T* dst = outputBuffer + layerIdx * layerOutputCapacity + tokenOffset * pleHiddenSize + col % pleHiddenSize;
+        if (zeroFill)
+        {
+            zeroChunk<T, kElems>(dst);
+        }
+        else
+        {
+            float values[kElems];
+            loadChunk<F>(table, row, col, values);
+            storeChunk(values, dst);
+        }
+    }
 }
 
 } // namespace
-
-template <typename T>
-__global__ void gemma4PleGatherKernel(int32_t const* inputIds, T const* pleTable, T* outputBuffer,
-    int64_t layerOutputCapacity, int64_t batchSize, int64_t seqLen, int32_t vocabSize, int32_t numLayers,
-    int32_t pleHiddenSize, int32_t imageTokenId, int32_t audioTokenId)
-{
-    int64_t const seqIdx = blockIdx.x;
-    int64_t const batchIdx = blockIdx.y;
-    int32_t const layerIdx = blockIdx.z;
-
-    if (batchIdx >= batchSize || seqIdx >= seqLen || layerIdx >= numLayers)
-    {
-        return;
-    }
-
-    int64_t const tokenOffset = batchIdx * seqLen + seqIdx;
-    int32_t const tokenId = inputIds[tokenOffset];
-    bool const zeroFill = tokenId < 0 || tokenId >= vocabSize || (imageTokenId >= 0 && tokenId == imageTokenId)
-        || (audioTokenId >= 0 && tokenId == audioTokenId);
-
-    int64_t const outputOffset = static_cast<int64_t>(layerIdx) * layerOutputCapacity + tokenOffset * pleHiddenSize;
-    int64_t const tableOffset = (static_cast<int64_t>(tokenId) * numLayers + layerIdx) * pleHiddenSize;
-
-    constexpr uint32_t kVecSize = DVec<T>::vec_size;
-    for (int32_t hiddenIdx = threadIdx.x * kVecSize; hiddenIdx < pleHiddenSize; hiddenIdx += blockDim.x * kVecSize)
-    {
-        DVec<T> valueVec;
-        if (zeroFill)
-        {
-#pragma unroll
-            for (uint32_t i = 0; i < kVecSize; ++i)
-            {
-                valueVec[i] = T{};
-            }
-        }
-        else
-        {
-            valueVec.load(pleTable + tableOffset + hiddenIdx);
-        }
-        valueVec.store(outputBuffer + outputOffset + hiddenIdx);
-    }
-}
-
-template <typename T>
-void launchGemma4PleGather(int32_t const* inputIds, T const* pleTable, T* outputBuffer, int64_t layerOutputCapacity,
-    int64_t batchSize, int64_t seqLen, int32_t vocabSize, int32_t numLayers, int32_t pleHiddenSize,
-    int32_t imageTokenId, int32_t audioTokenId, cudaStream_t stream)
-{
-    constexpr uint32_t kVecSize = DVec<T>::vec_size;
-    check::check(pleHiddenSize % kVecSize == 0,
-        format::fmtstr("pleHiddenSize must be a multiple of %d for vectorized access", kVecSize));
-
-    dim3 const grid(seqLen, batchSize, numLayers);
-    dim3 const block(256);
-    gemma4PleGatherKernel<<<grid, block, 0, stream>>>(inputIds, pleTable, outputBuffer, layerOutputCapacity, batchSize,
-        seqLen, vocabSize, numLayers, pleHiddenSize, imageTokenId, audioTokenId);
-}
 
 constexpr int32_t kMetadataScanThreads{256};
 
@@ -597,25 +742,28 @@ void assembleDeepstackEmbedding(rt::Tensor const& inputIds, rt::Tensor const& de
         outputPtr, batchSize, seqLen, imageTokenId, hiddenSize, numImageTokens, multimodalIndicesPtr);
 }
 
-void embeddingLookup(rt::Tensor const& inputIds, rt::Tensor const& embeddingTable, rt::OptionalInputTensor scales,
-    rt::Tensor& output, cudaStream_t stream, rt::OptionalInputTensor multimodalIndices,
-    std::optional<int32_t> imageTokenId, rt::OptionalInputTensor imageEmbeds, std::optional<int32_t> audioTokenId,
-    rt::OptionalInputTensor audioEmbeds)
+int64_t validateEmbeddingTable(EmbeddingTableDescriptor const& table)
 {
-    // Validate input shapes
+    return makeTableView(table).cols;
+}
+
+void embeddingLookup(rt::Tensor const& inputIds, EmbeddingTableDescriptor const& table, rt::Tensor& output,
+    cudaStream_t stream, rt::OptionalInputTensor multimodalIndices, std::optional<int32_t> imageTokenId,
+    rt::OptionalInputTensor imageEmbeds, std::optional<int32_t> audioTokenId, rt::OptionalInputTensor audioEmbeds)
+{
+    TableView const view = makeTableView(table);
     auto const inputShape = inputIds.getShape();
-    auto const embeddingShape = embeddingTable.getShape();
     auto const outputShape = output.getShape();
 
     check::check(inputShape.getNumDims() == 2, "inputIds must be 2D tensor [batchSize, seqLen]");
-    check::check(embeddingShape.getNumDims() == 2, "embeddingTable must be 2D tensor [vocabSize, hiddenSize]");
     check::check(outputShape.getNumDims() == 2 || outputShape.getNumDims() == 3,
         "output must be token-major [physicalTokens, hiddenSize] or [batchSize, seqLen, hiddenSize]");
+    check::check(
+        view.rows <= std::numeric_limits<int32_t>::max(), "embedding table vocab dimension exceeds int32 range");
 
     int64_t const batchSize = inputShape[0];
     int64_t const seqLen = inputShape[1];
-    int32_t const vocabSize = static_cast<int32_t>(embeddingShape[0]);
-    int64_t const hiddenSize = embeddingShape[1];
+    int64_t const hiddenSize = view.cols;
 
     // Validate output shape
     if (outputShape.getNumDims() == 2)
@@ -684,103 +832,99 @@ void embeddingLookup(rt::Tensor const& inputIds, rt::Tensor const& embeddingTabl
     half const* audioEmbedsPtr = hasAudio ? audioEmbeds->get().dataPointer<half>() : nullptr;
     int64_t const audioTokenLen = hasAudio ? audioEmbeds->get().getShape()[0] : 0;
 
-    // Get device pointers
     int32_t const* inputIdsPtr = inputIds.dataPointer<int32_t>();
     int32_t const* multimodalIndicesPtr = hasMultimodal ? multimodalIndices->get().dataPointer<int32_t>() : nullptr;
     half* outputPtr = output.dataPointer<half>();
-
-    // Dispatch based on embedding table datatype
-    bool const isFP8Embedding = (embeddingTable.getDataType() == nvinfer1::DataType::kFP8);
-    if (isFP8Embedding)
+    int64_t const numTokens = batchSize * seqLen;
+    if (numTokens == 0)
     {
-#if SUPPORTS_FP8
-        constexpr uint32_t vecSize = DVec<__nv_fp8_e4m3>::vec_size;
-        check::check(scales.has_value(), "scales must be provided for FP8 embedding table");
-        auto const& scalesTensor = scales.value().get();
-        auto const scaleShape = scalesTensor.getShape();
-
-        check::check(scaleShape.getNumDims() == 2, "scales must be 2D tensor [vocabSize, hiddenSize / blockSize]");
-        check::check(scaleShape[0] == vocabSize, "Scale vocab size must match embeddingTable vocab size");
-        check::check(scaleShape[1] > 0, "Scale second dimension must be positive");
-        check::check(hiddenSize % scaleShape[1] == 0, "hiddenSize must be divisible by number of scale groups");
-        check::check(scalesTensor.getDataType() == nvinfer1::DataType::kFLOAT, "scales must be FP32");
-
-        int64_t const nGroups = scaleShape[1];
-        int64_t const blockSize = hiddenSize / nGroups;
-        check::check(hiddenSize % vecSize == 0,
-            format::fmtstr("hiddenSize must be a multiple of %d for efficient vectorized access", vecSize));
-        check::check(blockSize % vecSize == 0,
-            format::fmtstr("blockSize must be a multiple of %d for efficient vectorized FP8 dequantization", vecSize));
-
-        __nv_fp8_e4m3 const* tablePtr = embeddingTable.dataPointer<__nv_fp8_e4m3>();
-        float const* scalePtr = scalesTensor.dataPointer<float>();
-
-        Fp8EmbeddingLoader loader{tablePtr, scalePtr, blockSize, nGroups};
-        launchEmbeddingLookupKernel(inputIdsPtr, loader, multimodalIndicesPtr, imageTokenIdValue, imageEmbedsPtr,
-            imageTokenLen, audioTokenIdValue, audioEmbedsPtr, audioTokenLen, outputPtr, batchSize, seqLen, vocabSize,
-            hiddenSize, stream);
-#else
-        check::check(
-            false, "FP8 multimodal embedding lookup is unavailable: build does not support FP8 (SUPPORTS_FP8=0)");
-#endif
+        return;
     }
-    else
-    {
-        check::check(embeddingTable.getDataType() == nvinfer1::DataType::kHALF, "embeddingTable must be FP16 or FP8");
-        half const* embeddingTablePtr = embeddingTable.dataPointer<half>();
 
-        Fp16EmbeddingLoader loader{embeddingTablePtr};
-        launchEmbeddingLookupKernel(inputIdsPtr, loader, multimodalIndicesPtr, imageTokenIdValue, imageEmbedsPtr,
-            imageTokenLen, audioTokenIdValue, audioEmbedsPtr, audioTokenLen, outputPtr, batchSize, seqLen, vocabSize,
-            hiddenSize, stream);
-    }
+    dim3 const threadsPerBlock(kGatherWarpSize, kLookupWarpsPerBlock);
+    int64_t const gridSize = (numTokens + kLookupWarpsPerBlock - 1) / kLookupWarpsPerBlock;
+    dispatchFormat(view.format, [&](auto format) {
+        embeddingLookupKernelImpl<decltype(format)::value><<<gridSize, threadsPerBlock, 0, stream>>>(inputIdsPtr, view,
+            multimodalIndicesPtr, imageTokenIdValue, imageEmbedsPtr, imageTokenLen, audioTokenIdValue, audioEmbedsPtr,
+            audioTokenLen, outputPtr, numTokens);
+    });
+    CUDA_CHECK(cudaGetLastError());
 }
 
-void gemma4PleGather(rt::Tensor const& inputIds, rt::Tensor const& pleTable, rt::Tensor& outputBuffer,
-    int32_t numLayers, int32_t pleHiddenSize, int32_t imageTokenId, int32_t audioTokenId, cudaStream_t stream)
+void embeddingLookup(rt::Tensor const& inputIds, rt::Tensor const& embeddingTable, rt::OptionalInputTensor scales,
+    rt::Tensor& output, cudaStream_t stream, rt::OptionalInputTensor multimodalIndices,
+    std::optional<int32_t> imageTokenId, rt::OptionalInputTensor imageEmbeds, std::optional<int32_t> audioTokenId,
+    rt::OptionalInputTensor audioEmbeds)
 {
+    embeddingLookup(inputIds, EmbeddingTableDescriptor{embeddingTable, scales}, output, stream, multimodalIndices,
+        imageTokenId, imageEmbeds, audioTokenId, audioEmbeds);
+}
+
+void gemma4PleGather(rt::Tensor const& inputIds, EmbeddingTableDescriptor const& pleTable, rt::Tensor& outputBuffer,
+    int32_t numLayers, int32_t pleHiddenSize, int32_t imageTokenId, int32_t audioTokenId, cudaStream_t stream,
+    rt::OptionalInputTensor rowIndex)
+{
+    TableView const view = makeTableView(pleTable);
     auto const inputShape = inputIds.getShape();
-    auto const tableShape = pleTable.getShape();
     auto const outputShape = outputBuffer.getShape();
+    nvinfer1::DataType const outputType = outputBuffer.getDataType();
 
     check::check(inputShape.getNumDims() == 2, "inputIds must be 2D tensor [batchSize, seqLen]");
-    check::check(tableShape.getNumDims() == 2, "pleTable must be 2D tensor [vocabSize, numLayers * pleHiddenSize]");
     check::check(outputShape.getNumDims() == 4,
         "outputBuffer must be 4D tensor [numLayers, maxBatchSize, maxSeqLen, pleHiddenSize]");
     check::check(inputIds.getDataType() == nvinfer1::DataType::kINT32, "inputIds must be INT32");
-    check::check(outputBuffer.getDataType() == pleTable.getDataType(), "outputBuffer dtype must match pleTable dtype");
+    check::check(outputType == nvinfer1::DataType::kHALF
+            || (outputType == nvinfer1::DataType::kBF16 && view.format == TableFormat::kBF16),
+        "outputBuffer dtype must be FP16, or BF16 for a BF16 pleTable");
     check::check(numLayers > 0, "numLayers must be positive");
     check::check(pleHiddenSize > 0, "pleHiddenSize must be positive");
     check::check(outputShape[0] == numLayers, "outputBuffer first dimension must match numLayers");
     check::check(outputShape[3] == pleHiddenSize, "outputBuffer hidden dimension must match pleHiddenSize");
-    check::check(tableShape[1] == static_cast<int64_t>(numLayers) * pleHiddenSize,
+    check::check(view.cols == static_cast<int64_t>(numLayers) * pleHiddenSize,
         "pleTable second dimension must match numLayers * pleHiddenSize");
-    check::check(tableShape[0] <= std::numeric_limits<int32_t>::max(), "pleTable vocab dimension exceeds int32 range");
-    check::check(
-        pleTable.getDataType() == nvinfer1::DataType::kHALF || pleTable.getDataType() == nvinfer1::DataType::kBF16,
-        "pleTable must be FP16 or BF16");
+    check::check(view.rows <= std::numeric_limits<int32_t>::max(), "pleTable vocab dimension exceeds int32 range");
+    int64_t const elems = chunkElems(view.format);
+    check::check(pleHiddenSize % elems == 0,
+        format::fmtstr("pleHiddenSize %d must be a multiple of %ld for vectorized access", pleHiddenSize, elems));
+    check::check(view.group == 0 || pleHiddenSize % view.group == 0,
+        format::fmtstr("pleTable scale group %ld must divide pleHiddenSize %d", view.group, pleHiddenSize));
 
     int64_t const batchSize = inputShape[0];
     int64_t const seqLen = inputShape[1];
     check::check(batchSize <= outputShape[1], "inputIds batch size exceeds outputBuffer capacity");
     check::check(seqLen <= outputShape[2], "inputIds sequence length exceeds outputBuffer capacity");
+    if (rowIndex.has_value())
+    {
+        check::check(
+            rowIndex->get().getShape() == inputShape && rowIndex->get().getDataType() == nvinfer1::DataType::kINT32,
+            "rowIndex must be INT32 with the inputIds shape");
+    }
+    int32_t const* rowIndexPtr = rowIndex.has_value() ? rowIndex->get().dataPointer<int32_t>() : nullptr;
+    int64_t const numTokens = batchSize * seqLen;
+    if (numTokens == 0)
+    {
+        return;
+    }
 
     int64_t const layerOutputCapacity = outputShape[1] * outputShape[2] * pleHiddenSize;
-    int32_t const vocabSize = static_cast<int32_t>(tableShape[0]);
     int32_t const* inputIdsPtr = inputIds.dataPointer<int32_t>();
-
-    if (pleTable.getDataType() == nvinfer1::DataType::kHALF)
-    {
-        launchGemma4PleGather(inputIdsPtr, pleTable.dataPointer<half>(), outputBuffer.dataPointer<half>(),
-            layerOutputCapacity, batchSize, seqLen, vocabSize, numLayers, pleHiddenSize, imageTokenId, audioTokenId,
-            stream);
-    }
-    else
-    {
-        launchGemma4PleGather(inputIdsPtr, pleTable.dataPointer<__nv_bfloat16>(),
-            outputBuffer.dataPointer<__nv_bfloat16>(), layerOutputCapacity, batchSize, seqLen, vocabSize, numLayers,
-            pleHiddenSize, imageTokenId, audioTokenId, stream);
-    }
+    auto launch = [&](auto format, auto* outputPtr) {
+        using T = std::remove_pointer_t<decltype(outputPtr)>;
+        gemma4PleGatherKernel<decltype(format)::value, T><<<numTokens, kPleGatherThreads, 0, stream>>>(
+            inputIdsPtr, rowIndexPtr, view, outputPtr, layerOutputCapacity, pleHiddenSize, imageTokenId, audioTokenId);
+    };
+    dispatchFormat(view.format, [&](auto format) {
+        if constexpr (decltype(format)::value == TableFormat::kBF16)
+        {
+            if (outputType == nvinfer1::DataType::kBF16)
+            {
+                launch(format, outputBuffer.dataPointer<__nv_bfloat16>());
+                return;
+            }
+        }
+        launch(format, outputBuffer.dataPointer<half>());
+    });
+    CUDA_CHECK(cudaGetLastError());
 }
 
 } // namespace kernel

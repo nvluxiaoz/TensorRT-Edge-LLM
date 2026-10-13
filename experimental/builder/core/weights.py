@@ -26,6 +26,9 @@ from typing import Callable, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 
+from tensorrt_edgellm.checkpoint.embedding_quantization import (
+    INT4_GROUP_SIZE, INT4_MAX, INT4_ZERO_POINT, quantize_symmetric)
+
 from ..weight_packing import int4 as int4_pack
 from ..weight_packing import nvfp4 as nvfp4_pack
 from . import quantization
@@ -125,6 +128,7 @@ class Weights:
                  int4_gemm_plugin_version: int = 2,
                  checkpoint_source: str = "component",
                  tie_word_embeddings: bool = False,
+                 int4_lm_head: bool = False,
                  policy: Optional[WeightPolicy] = None) -> None:
         self.conversion = conversion
         checkpoint_dir = getattr(conversion, "checkpoint_dir", None)
@@ -146,6 +150,7 @@ class Weights:
             raise ValueError("checkpoint_source must be component or target")
         self.checkpoint_source = checkpoint_source
         self.tie_word_embeddings = bool(tie_word_embeddings)
+        self.int4_lm_head = int4_lm_head
         self._policy = policy or WeightPolicy()
 
     def close(self) -> None:
@@ -875,6 +880,39 @@ class Weights:
             logical_in_features=in_features,
         )
 
+    def int4_tied_lm_head(self, prefix: str) -> LinearWeights:
+        """Quantize a tied embedding head to symmetric INT4 for the GEMM plugin.
+
+        Round-to-nearest with FP16 scales per 128 inputs; stored nibbles are
+        ``q + 8``, the AWQ layout with zero point 8. Rows are processed in
+        chunks of whole plugin tiles, so the FP32 table is never materialized.
+        """
+        key = self._resolve(prefix + ".weight")
+        vocab_size, hidden_size = (int(dim) for dim in self.store.shape(key))
+        if hidden_size % 64:
+            raise ValueError(f"{key}: INT4 head needs hidden size % 64 == 0, "
+                             f"got {hidden_size}")
+        chunk_rows = 4096
+        packed, scales = [], []
+        for start in range(0, vocab_size, chunk_rows):
+            rows = self.store.get_f32_rows(key, start,
+                                           min(vocab_size, start + chunk_rows))
+            quantized, scale = quantize_symmetric(rows, INT4_GROUP_SIZE,
+                                                  INT4_MAX, np.float16)
+            nibbles = (quantized + INT4_ZERO_POINT).astype(np.uint8)
+            packed.append(
+                int4_pack._pack_for_gemm(nibbles,
+                                         self.int4_gemm_plugin_version))
+            scales.append(scale)
+        return LinearWeights(
+            quantization.QUANT_INT4_AWQ,
+            np.concatenate(packed),
+            weight_scale=np.ascontiguousarray(np.concatenate(scales).T),
+            group_size=INT4_GROUP_SIZE,
+            logical_out_features=vocab_size,
+            logical_in_features=hidden_size,
+        )
+
     def linear_descriptor(self,
                           prefix: str,
                           quant_type: str,
@@ -887,6 +925,8 @@ class Weights:
             raise ValueError(
                 f"{prefix}: quantization config selects NVFP4, but the "
                 "checkpoint has no NVFP4 weight and scale tensors")
+        if self.int4_lm_head and prefix in ("lm_head", "model.embed_tokens"):
+            return self.int4_tied_lm_head(prefix)
         if (quant_type == quantization.QUANT_NVFP4
                 and external_kind and self._policy.externalizes_parameter(
                     external_kind, prefix)):

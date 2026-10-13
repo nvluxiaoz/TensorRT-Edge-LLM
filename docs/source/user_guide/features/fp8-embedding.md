@@ -1,124 +1,63 @@
-# FP8 Embedding
+# Embedding Quantization
 
 ## Overview
 
-FP8 embedding reduces memory usage by quantizing the embedding table from FP16 to FP8 (NVIDIA FP8 E4M3 format), achieving **~50% memory reduction** for the embedding table. This is particularly beneficial for models with large vocabularies where the embedding table can be a significant portion of total memory usage.
+The token embedding table (`embedding.safetensors`) and the Gemma 4 per-layer embedding table (`ple_embedding.safetensors`) can be stored quantized. The runtime dequantizes only the looked-up rows, so the output is FP16 and the tables stay compact in memory. This matters most for large vocabularies: Gemma 4 E2B has a 768 MiB FP16 token table and a 4480 MiB FP16 per-layer table.
 
-**Key Points**:
-- Reduces embedding table memory by ~50% (FP8 vs FP16)
-- Uses NVIDIA FP8 E4M3 format with per-row block-wise quantization (block size 128)
-- Can be used independently or combined with other quantization methods (NVFP4, INT4, FP8 weights)
-- Automatically detected during engine build from safetensors metadata
-- Output is always FP16 — dequantization happens on-the-fly during embedding lookup
+| Format | Data | Scales | Group | Size vs FP16 |
+|---|---|---|---|---|
+| `fp16` (default) | FP16 | – | – | 100% |
+| `fp8` | FP8 E4M3 | FP32 | 128 | ~52% |
+| `int8` | INT8, symmetric | FP32 | one row (token); 256, one per layer (per-layer table) | ~50% |
+| `int4` | INT4, symmetric, two per byte | FP32 | 128 | ~27% |
+| `nvfp4` | FP4 E2M1, two per byte | FP8 E4M3 + one FP32 global scale | 16 | ~28% |
+
+Quantization is direct round-to-nearest on the absolute maximum of each group; no calibration data is needed. The gather is plain CUDA and runs on every supported GPU, including Jetson Orin.
 
 ---
 
 ## Workflow
 
-Export with `--fp8-embedding` to write the runtime embedding sidecar in FP8:
+### ONNX Export
 
 ```bash
-export EDGE_LLM_PATH=/path/to/TensorRT-Edge-LLM
-cd $EDGE_LLM_PATH
-export PYTHONPATH=$EDGE_LLM_PATH:$PYTHONPATH
-
 tensorrt-edgellm-export \
-  /path/to/Qwen3-8B \
-  /tmp/qwen3_onnx_fp8emb \
-  --fp8-embedding
+  /path/to/gemma-4-E2B-it \
+  /tmp/gemma4_e2b_onnx \
+  --embedding-quantization int8 \
+  --ple-quantization int4
 ```
 
-This flag only changes `embedding.safetensors`; it does not change the ONNX graph or the checkpoint weights. The sidecar contains the FP8 embedding table plus `embedding_scale`.
+`--fp8-embedding` is an alias for `--embedding-quantization fp8`. The flags only change the sidecar files; the ONNX graph and the checkpoint weights are unchanged. Build and run the engine as usual: the format is detected from the sidecar tensors.
 
-### Build Engine
+### Direct Engine Builder and Server
 
-Build the TensorRT engine as usual. The build process automatically detects FP8 embedding from the safetensors metadata:
+The direct builder and `tensorrt-edgellm-serve` accept the same `--embedding-quantization` and `--ple-quantization` flags. By default the runtime reads both FP16 tables from the checkpoint; a quantized choice writes the sidecar into the engine directory instead.
 
-```bash
-./build/examples/llm/llm_build \
-  --onnxDir /tmp/qwen3_onnx_fp8emb/llm \
-  --engineDir engines/qwen3-8b-fp8emb \
-  --maxBatchSize=1
-```
-
-No special build flags are required — FP8 embedding is automatically enabled based on the safetensors metadata.
-
-### Run Inference
-
-Run inference with the built engine. No special flags are needed:
-
-```bash
-./build/examples/llm/llm_inference \
-  --engineDir engines/qwen3-8b-fp8emb \
-  --inputFile tests/test_cases/llm_basic.json \
-  --outputFile output.json
-```
-
----
-
-## Combining with Other Quantization
-
-FP8 embedding can be combined with weight quantization for maximum memory savings:
-
-```bash
-export EDGE_LLM_PATH=/path/to/TensorRT-Edge-LLM
-cd $EDGE_LLM_PATH
-export PYTHONPATH=$EDGE_LLM_PATH:$PYTHONPATH
-
-# Step 1: Quantize weights to a checkpoint
-tensorrt-edgellm-quantize llm \
-  --model_dir /path/to/Qwen3-8B \
-  --output_dir /tmp/qwen3_nvfp4 \
-  --quantization nvfp4
-
-# Step 2: Export with both NVFP4 weights and FP8 embedding
-tensorrt-edgellm-export \
-  /tmp/qwen3_nvfp4 \
-  /tmp/qwen3_nvfp4_fp8emb_onnx \
-  --fp8-embedding
-```
+For models with tied word embeddings, `--lm-head-quantization int4` quantizes the LM head into the engine (symmetric, group 128, FP16 scales) for the INT4 GEMM plugin. It is opt-in: check accuracy on your task before deploying it. With an FP16 tied head, the runtime embedding shares the head's storage, so no second copy of the table is loaded.
 
 ---
 
 ## Technical Details
 
-### Quantization Format
+Both sidecars store the table already multiplied by the model's embedding scale. Tensor names, with `embedding` for the token table and `weight` for the per-layer table:
 
-- **Format**: NVIDIA FP8 E4M3 (4 exponent bits, 3 mantissa bits)
-- **Scale Granularity**: Per-row block-wise quantization with block size 128
-- **Scale Shape**: `[vocab_size, hidden_size / 128]` — one scale per 128 elements in each row
-- **Memory Reduction**: ~50% reduction compared to FP16 (8 bits vs 16 bits per element)
+| Format | Tensors |
+|---|---|
+| `fp16` | `embedding` |
+| `fp8`, `int8`, `int4` | `embedding`, `embedding_scale` (`[rows, cols / group]`) |
+| `nvfp4` | `embedding`, `embedding_block_scale`, `embedding_multiplier_scale` |
 
-### Quantization Process
+- Packed formats store the even element in the low nibble. INT4 stores `q + 8`.
+- NVFP4 sidecars carry their logical shape and group size in the safetensors metadata.
+- Per-layer table groups never cross a layer boundary.
 
-During export with `--fp8-embedding` in `tensorrt_edgellm`:
-1. The embedding table is divided into blocks of 128 elements along the hidden dimension
-2. For each block, the maximum absolute value is computed
-3. Quantization scale is computed: `scale = amax / FP8_E4M3_MAX` (where `FP8_E4M3_MAX = 448.0`)
-4. Each block is quantized to FP8 using its scale
-5. Both the FP8 embedding table and scales are saved to safetensors
-
-### Runtime Behavior
-
-During inference:
-- The embedding kernel detects FP8 format from the tensor dtype
-- For each token lookup, the corresponding row is dequantized on-the-fly
-- Dequantization uses the per-block scales: `output = fp8_value * scale`
-- Output is always FP16 for downstream computation
-
----
-
-## Notes
-
-- **No Calibration Required**: Unlike FP8 KV cache, FP8 embedding uses direct min-max quantization and does not require calibration data.
-- **Independent of Weight Quantization**: FP8 embedding can be enabled independently of weight quantization. You can use FP16 weights with FP8 embedding, or combine with NVFP4/INT4/FP8 weight quantization.
-- **Automatic Detection**: Engine build and runtime automatically detect FP8 embedding from safetensors metadata — no special flags needed after export.
-- **Memory Benefits**: Most beneficial for models with large vocabularies (e.g., 150K+ tokens) where embedding tables can be 500MB+ in FP16.
-- **Accuracy**: Block-wise quantization with block size 128 preserves accuracy well in practice. The embedding lookup output is identical to FP16 within quantization tolerance.
+The writer streams the table in row chunks, so even the multi-GB per-layer table is quantized with bounded host memory.
 
 ---
 
 ## Limitations
 
-- **TTS Models Not Supported**: FP8 embedding is not supported for TTS, Qwen3-Omni talker, and code_predictor models due to specialized kernel requirements. When requested for these models, a warning is logged and FP16 embedding is used instead.
-- **Platform Requirements**: Requires CUDA 11.8+ for FP8 support and GPUs with compute capability SM89+ (Ada/Hopper/Blackwell) for native FP8 hardware support.
+- Embedding quantization applies to the LLM thinker only. For TTS, the Qwen3-Omni talker and code predictor, a warning is logged and FP16 embeddings are used.
+- Speculative-decoding draft engines use the base model's embedding sidecar.
+- `--lm-head-quantization int4` requires tied word embeddings and does not combine with `--reduced-vocab-dir` or tensor parallelism.

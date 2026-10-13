@@ -471,8 +471,8 @@ bool BlockDiffusionDecoder::commitBlock(
 
     check::check(io.inputsEmbeds.reshape({batchSize * commitSeqLen, mRuntime.deployment.base.hiddenSize}),
         "Tensor reshape failed");
-    kernel::embeddingLookup(mCommitCanvasIds, mRuntime.preprocess.embedding.table,
-        mRuntime.preprocess.embedding.scalesAsOptional(), io.inputsEmbeds, context.stream);
+    kernel::embeddingLookup(
+        mCommitCanvasIds, mRuntime.preprocess.embedding.descriptor(), io.inputsEmbeds, context.stream);
     if (mRuntime.preprocess.gemma4Ple)
     {
         mRuntime.preprocess.gemma4Ple->embed(mCommitCanvasIds, context.stream);
@@ -743,8 +743,8 @@ bool BlockDiffusionDecoder::captureCudaGraphs(cudaStream_t stream)
         check::check(mRuntime.base.pipelineIO.inputsEmbeds.reshape(
                          {batchSize * captureCanvasLen, mRuntime.deployment.base.hiddenSize}),
             "Tensor reshape failed");
-        kernel::embeddingLookup(mCommitCanvasIds, mRuntime.preprocess.embedding.table,
-            mRuntime.preprocess.embedding.scalesAsOptional(), mRuntime.base.pipelineIO.inputsEmbeds, stream);
+        kernel::embeddingLookup(mCommitCanvasIds, mRuntime.preprocess.embedding.descriptor(),
+            mRuntime.base.pipelineIO.inputsEmbeds, stream);
         if (mRuntime.preprocess.gemma4Ple)
         {
             mRuntime.preprocess.gemma4Ple->embed(mCommitCanvasIds, stream);

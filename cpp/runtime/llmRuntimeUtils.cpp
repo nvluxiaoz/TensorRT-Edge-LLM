@@ -862,82 +862,51 @@ std::vector<int32_t> buildBatchMapping(std::vector<int8_t> const& finishedStates
 // Embedding Loading Utilities
 //=============================================================================
 
-EmbeddingData loadEmbeddingTable(std::filesystem::path const& embeddingPath, cudaStream_t stream)
+EmbeddingData loadEmbeddingTable(std::filesystem::path const& path, std::string const& tensorName, cudaStream_t stream)
 {
-    ELLM_CHECK(std::filesystem::exists(embeddingPath),
-        format::fmtstr("Embedding file not found: %s", embeddingPath.string().c_str()));
+    ELLM_CHECK(std::filesystem::exists(path), format::fmtstr("Embedding file not found: %s", path.string().c_str()));
 
     std::vector<rt::Tensor> tensors;
-    ELLM_CHECK(safetensors::loadSafetensors(embeddingPath, tensors, stream),
-        format::fmtstr("Failed to load embedding file: %s", embeddingPath.string().c_str()));
+    ELLM_CHECK(safetensors::loadSafetensors(path, tensors, stream),
+        format::fmtstr("Failed to load embedding file: %s", path.string().c_str()));
+    auto const find = [&tensors](std::string const& name) -> rt::Tensor* {
+        auto const it = std::find_if(
+            tensors.begin(), tensors.end(), [&name](rt::Tensor const& tensor) { return tensor.getName() == name; });
+        return it == tensors.end() ? nullptr : &*it;
+    };
 
-    // Find tensors by name
-    rt::Tensor* embeddingPtr = nullptr;
-    rt::Tensor* scalesPtr = nullptr;
-
-    for (auto& tensor : tensors)
-    {
-        if (tensor.getName() == "embedding")
-        {
-            embeddingPtr = &tensor;
-        }
-        else if (tensor.getName() == "embedding_scale")
-        {
-            scalesPtr = &tensor;
-        }
-    }
-
-    ELLM_CHECK(embeddingPtr != nullptr,
-        format::fmtstr("Embedding file missing 'embedding' tensor: %s", embeddingPath.string().c_str()));
-
-    ELLM_CHECK(embeddingPtr->getShape().getNumDims() == 2,
-        format::fmtstr("Embedding tensor must be 2D, got %d dimensions", embeddingPtr->getShape().getNumDims()));
-
-    int64_t vocabSize = embeddingPtr->getShape()[0];
-    int64_t hiddenSize = embeddingPtr->getShape()[1];
+    rt::Tensor* table = find(tensorName);
+    ELLM_CHECK(table != nullptr,
+        format::fmtstr("Embedding file %s is missing tensor '%s'", path.string().c_str(), tensorName.c_str()));
+    rt::Tensor* blockScale = find(tensorName + "_block_scale");
+    rt::Tensor* scale = blockScale != nullptr ? blockScale : find(tensorName + "_scale");
+    rt::Tensor* multiplier = blockScale != nullptr ? find(tensorName + "_multiplier_scale") : nullptr;
+    ELLM_CHECK(blockScale == nullptr || multiplier != nullptr,
+        format::fmtstr("NVFP4 table '%s' in %s requires '%s_multiplier_scale'", tensorName.c_str(),
+            path.string().c_str(), tensorName.c_str()));
+    size_t const expectedTensors = 1 + (scale != nullptr ? 1 : 0) + (multiplier != nullptr ? 1 : 0);
+    ELLM_CHECK(tensors.size() == expectedTensors,
+        format::fmtstr("Embedding file %s holds %zu tensors; expected only '%s' and its scales", path.string().c_str(),
+            tensors.size(), tensorName.c_str()));
 
     EmbeddingData result;
-
-    // Detect FP8 vs FP16 by checking dtype
-    if (embeddingPtr->getDataType() == nvinfer1::DataType::kFP8)
+    if (multiplier != nullptr)
     {
-        // FP8 format - requires scales
-        ELLM_CHECK(scalesPtr != nullptr,
-            format::fmtstr("FP8 embedding requires 'embedding_scale' tensor: %s", embeddingPath.string().c_str()));
-
-        ELLM_CHECK(scalesPtr->getDataType() == nvinfer1::DataType::kFLOAT,
-            format::fmtstr("embedding_scale must have FP32 dtype, got %d", static_cast<int>(scalesPtr->getDataType())));
-
-        ELLM_CHECK(scalesPtr->getShape().getNumDims() == 2,
-            format::fmtstr("embedding_scale must be 2D, got %d dimensions", scalesPtr->getShape().getNumDims()));
-
-        int64_t scaleVocabSize = scalesPtr->getShape()[0];
-        int64_t numGroups = scalesPtr->getShape()[1];
-
-        ELLM_CHECK(vocabSize == scaleVocabSize,
-            format::fmtstr("Vocab size mismatch: embedding has %ld, scales has %ld", vocabSize, scaleVocabSize));
-
-        ELLM_CHECK(hiddenSize % kFP8EmbeddingBlockSize == 0,
-            format::fmtstr("Hidden size %ld must be divisible by block size %ld", hiddenSize, kFP8EmbeddingBlockSize));
-
-        int64_t expectedNumGroups = hiddenSize / kFP8EmbeddingBlockSize;
-        ELLM_CHECK(numGroups == expectedNumGroups,
-            format::fmtstr("Scale groups mismatch: expected %ld, got %ld", expectedNumGroups, numGroups));
-
-        LOG_INFO(
-            "Loaded FP8 embedding: [%ld, %ld], scales: [%ld, %ld]", vocabSize, hiddenSize, scaleVocabSize, numGroups);
-
-        result.table = std::move(*embeddingPtr);
-        result.tableScalingFactor = std::move(*scalesPtr);
+        ELLM_CHECK(multiplier->getDataType() == nvinfer1::DataType::kFLOAT && multiplier->getShape().volume() == 1,
+            format::fmtstr("'%s_multiplier_scale' must be an FP32 scalar", tensorName.c_str()));
+        CUDA_CHECK(cudaMemcpyAsync(
+            &result.multiplier, multiplier->rawPointer(), sizeof(float), cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
     }
-    else
+    result.table = std::move(*table);
+    if (scale != nullptr)
     {
-        // FP16 format
-        LOG_INFO("Loaded FP16 embedding: [%ld, %ld]", vocabSize, hiddenSize);
-
-        result.table = std::move(*embeddingPtr);
+        result.tableScalingFactor = std::move(*scale);
     }
-
+    int64_t const cols = kernel::validateEmbeddingTable(result.descriptor());
+    LOG_INFO("Loaded embedding table '%s' from %s: [%ld, %ld], packed %s, scales %s, multiplier %g", tensorName.c_str(),
+        path.string().c_str(), result.table.getShape()[0], cols, result.table.getShape().formatString().c_str(),
+        result.tableScalingFactor.getShape().formatString().c_str(), static_cast<double>(result.multiplier));
     return result;
 }
 

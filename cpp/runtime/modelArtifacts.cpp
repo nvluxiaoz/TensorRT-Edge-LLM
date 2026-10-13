@@ -185,26 +185,30 @@ void validateDsparkTreeMetadataBindings(DeploymentConfig const& deployment, Engi
 
 ModelArtifacts ModelArtifacts::loadFromEngineDir(std::filesystem::path const& engineDir,
     std::optional<SpecDecodeDraftingConfig> const& draftingConfig, std::filesystem::path const& checkpointDir,
-    std::filesystem::path const& draftCheckpointDir, bool contextReuseEnabled, cudaStream_t stream)
+    std::filesystem::path const& draftCheckpointDir, bool contextReuseEnabled, cudaStream_t stream,
+    PleRuntimeConfig const& pleConfig)
 {
     ModelArtifacts artifacts;
     artifacts.checkpointDir = checkpointDir;
     artifacts.draftCheckpointDir = draftCheckpointDir;
+    artifacts.pleConfig = pleConfig;
 
     std::filesystem::path const baseConfigPath
         = draftingConfig.has_value() ? engineDir / "base_config.json" : engineDir / "config.json";
 
     // Finish checkpoint reads and weight conversion before any engine can run.
-    artifacts.weights.load(engineDir, baseConfigPath, stream, artifacts.checkpointDir);
+    artifacts.weights.load(engineDir, baseConfigPath, stream, artifacts.checkpointDir, {}, std::nullopt, std::nullopt,
+        pleConfig.residency == PleResidency::kCACHED);
     if (auto embedding = artifacts.weights.takeEmbedding())
     {
-        artifacts.embedding.table = std::move(*embedding);
+        artifacts.embedding = std::move(*embedding);
     }
     else
     {
-        artifacts.embedding = loadEmbeddingTable(engineDir / "embedding.safetensors", stream);
+        artifacts.embedding = loadEmbeddingTable(engineDir / "embedding.safetensors", "embedding", stream);
     }
     artifacts.pleEmbedding = artifacts.weights.takePleEmbedding();
+    artifacts.pleFileSource = artifacts.weights.takePleFileSource();
 
     std::optional<std::filesystem::path> const draftConfigPath = draftingConfig.has_value()
         ? std::optional<std::filesystem::path>{engineDir / "draft_config.json"}

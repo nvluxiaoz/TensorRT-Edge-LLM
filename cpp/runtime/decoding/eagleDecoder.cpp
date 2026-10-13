@@ -482,8 +482,8 @@ bool EagleDecoder::constructDraftProposal(DecodingInferenceContext& context)
         check::check(
             mRuntime.base.pipelineIO.inputsEmbeds.reshape({activeBatchSize, paddedDraftProposalSize, draftHiddenSize}),
             "Tensor reshape failed");
-        kernel::embeddingLookup(mRuntime.preprocess.idsInput, mRuntime.preprocess.embedding.table,
-            mRuntime.preprocess.embedding.scalesAsOptional(), mRuntime.base.pipelineIO.inputsEmbeds, context.stream);
+        kernel::embeddingLookup(mRuntime.preprocess.idsInput, mRuntime.preprocess.embedding.descriptor(),
+            mRuntime.base.pipelineIO.inputsEmbeds, context.stream);
 
         {
             Tensor const& draftKVCacheLengths = mDraftCacheManager.getKVCacheLengths();
@@ -606,8 +606,8 @@ bool EagleDecoder::runBaseModelVerification(DecodingInferenceContext& context)
     check::check(mRuntime.base.pipelineIO.inputsEmbeds.reshape({activeBatchSize,
                      mRuntime.deployment.specConfig->verifySize, mRuntime.deployment.base.hiddenSize}),
         "Tensor reshape failed");
-    kernel::embeddingLookup(mRuntime.preprocess.idsInput, mRuntime.preprocess.embedding.table,
-        mRuntime.preprocess.embedding.scalesAsOptional(), mRuntime.base.pipelineIO.inputsEmbeds, context.stream);
+    kernel::embeddingLookup(mRuntime.preprocess.idsInput, mRuntime.preprocess.embedding.descriptor(),
+        mRuntime.base.pipelineIO.inputsEmbeds, context.stream);
     int32_t const selectTokenSize = activeBatchSize * mRuntime.deployment.specConfig->verifySize;
     check::check(
         mRuntime.base.pipelineIO.outputLogits.reshape({selectTokenSize, mRuntime.deployment.base.outputVocabSize}),
@@ -798,8 +798,8 @@ bool EagleDecoder::runDraftModelAcceptToken(DecodingInferenceContext& context)
 
     check::check(mRuntime.base.pipelineIO.inputsEmbeds.reshape({activeBatchSize, inputIdsLength, draftHiddenSize}),
         "Tensor reshape failed");
-    kernel::embeddingLookup(mRuntime.preprocess.idsInput, mRuntime.preprocess.embedding.table,
-        mRuntime.preprocess.embedding.scalesAsOptional(), mRuntime.base.pipelineIO.inputsEmbeds, context.stream);
+    kernel::embeddingLookup(mRuntime.preprocess.idsInput, mRuntime.preprocess.embedding.descriptor(),
+        mRuntime.base.pipelineIO.inputsEmbeds, context.stream);
     {
         int32_t const acceptedTokenNum = static_cast<int32_t>(inputIdsLength);
         Tensor const& draftKVCacheLengths = mDraftCacheManager.getKVCacheLengths();

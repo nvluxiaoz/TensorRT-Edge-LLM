@@ -20,7 +20,10 @@ import shutil
 
 import numpy as np
 
-from .. import contracts, numpy_dtypes
+from tensorrt_edgellm.checkpoint.embedding_quantization import (
+    table_group_size, write_quantized_table)
+
+from .. import contracts
 from ..config import DeviceConfig
 from ..safetensors_np import SafetensorsStore, load_safetensors_tensor
 from ..weight_policy import (CHECKPOINT_BINDING_ENGINE_EMBEDDING,
@@ -113,6 +116,7 @@ def embedding_binding(weights: Weights, cfg: DeviceConfig) -> dict:
 def externalizes_ple(args, cfg: DeviceConfig) -> bool:
     """Whether Gemma4 PLE stays in the provider checkpoint."""
     return (cfg.hidden_size_per_layer_input > 0
+            and args.ple_quantization == "fp16"
             and args.weight_policy.wants(EXTERNAL_WEIGHT_FP16))
 
 
@@ -139,39 +143,53 @@ def ple_embedding_binding(weights: Weights, cfg: DeviceConfig) -> dict:
     return binding
 
 
+def _scaled_rows(store, key: str, scale: float):
+    """Row reader over one dense checkpoint table, scaled in FP32."""
+    multiplier = np.float32(scale)
+
+    def read_rows(start: int, stop: int) -> np.ndarray:
+        return store.get_f32_rows(key, start, stop) * multiplier
+
+    return read_rows
+
+
 def write_embedding(weights: Weights, cfg: DeviceConfig, args,
                     engine_dir: str) -> None:
+    fmt = args.embedding_quantization
+    scale = np.float16(cfg.embedding_scale)
+    path = os.path.join(engine_dir, "embedding.safetensors")
     # Runtime embeddings are FP16, including dequantized NVFP4 checkpoints.
     if weights.is_nvfp4("model.embed_tokens"):
         weight = weights.linear_fp16("model.embed_tokens")[0]
+    elif fmt == "fp16":
+        weight = weights.f16(EMBEDDING_KEY)
     else:
-        weight = weights.f16("model.embed_tokens.weight")
-    weight = np.ascontiguousarray(weight * np.float16(cfg.embedding_scale))
-    path = os.path.join(engine_dir, "embedding.safetensors")
-    if args.fp8_embedding:
-        if weight.shape[1] % 128:
-            raise ValueError(
-                "FP8 embedding hidden size must be divisible by 128")
-        grouped = weight.astype(np.float32).reshape(weight.shape[0], -1, 128)
-        scales = np.maximum(np.max(np.abs(grouped), axis=2), 1e-4) / 448.0
-        normalized = grouped / scales[..., None]
-        encoded = numpy_dtypes.f32_to_fp8_e4m3_bytes(normalized).reshape(
-            weight.shape)
-        save_safetensors(path, {
-            "embedding": encoded,
-            "embedding_scale": scales.astype(np.float32),
-        }, {"embedding": "F8_E4M3"})
-    else:
-        save_safetensors(path, {"embedding": weight})
+        key = weights.find(EMBEDDING_KEY)
+        shape = weights.store.shape(key)
+        write_quantized_table(path, "embedding", shape,
+                              _scaled_rows(weights.store, key, scale), fmt,
+                              table_group_size(fmt, shape[1]))
+        return
+    if fmt == "fp16":
+        save_safetensors(path,
+                         {"embedding": np.ascontiguousarray(weight * scale)})
+        return
+    write_quantized_table(
+        path, "embedding", weight.shape, lambda start, stop:
+        (weight[start:stop] * scale).astype(np.float32), fmt,
+        table_group_size(fmt, weight.shape[1]))
 
 
-def write_ple_embedding(weights: Weights, cfg: DeviceConfig,
+def write_ple_embedding(weights: Weights, cfg: DeviceConfig, args,
                         engine_dir: str) -> None:
-    weight = weights.f16("model.embed_tokens_per_layer.weight")
-    weight = np.ascontiguousarray(
-        weight * np.float16(np.sqrt(cfg.hidden_size_per_layer_input)))
-    save_safetensors(os.path.join(engine_dir, "ple_embedding.safetensors"),
-                     {"weight": weight})
+    fmt = args.ple_quantization
+    key = weights.find("model.embed_tokens_per_layer.weight")
+    shape = weights.store.shape(key)
+    layer_width = cfg.hidden_size_per_layer_input
+    write_quantized_table(
+        os.path.join(engine_dir, "ple_embedding.safetensors"), "weight", shape,
+        _scaled_rows(weights.store, key, np.float16(np.sqrt(layer_width))),
+        fmt, table_group_size(fmt, shape[1], layer_width))
 
 
 def copy_vocab_artifacts(args, engine_dir: str) -> None:

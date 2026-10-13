@@ -46,7 +46,6 @@ namespace trt_edgellm
 namespace rt
 {
 
-
 RuntimeCoordinator::RuntimeCoordinator(Config config)
     : mConfig(std::move(config))
     , mParallelConfig(mConfig.parallelConfig)
@@ -995,7 +994,7 @@ std::unique_ptr<LLMRankRuntime> RuntimeCoordinator::createRankRuntime(int32_t gl
     }
     return std::make_unique<LLMRankRuntime>(mConfig.engineDir, mConfig.multimodalEngineDir, mConfig.loraWeightsMap,
         mConfig.draftingConfig, mStreams[globalRank], mapping, *mTokenizer, *mChatTemplate, mConfig.contextCacheConfig,
-        mConfig.checkpointDir, mConfig.draftCheckpointDir);
+        mConfig.checkpointDir, mConfig.draftCheckpointDir, mConfig.pleConfig);
 }
 
 LLMGenerationRequest RuntimeCoordinator::prepareRequestState(LLMGenerationRequest const& request) const

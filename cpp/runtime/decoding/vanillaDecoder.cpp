@@ -89,11 +89,12 @@ bool VanillaDecoder::decodeStep(DecodingInferenceContext& context)
     check::check(
         mRuntime.base.pipelineIO.inputsEmbeds.reshape({activeBatchSize, 1, mRuntime.deployment.base.hiddenSize}),
         "Tensor reshape failed");
-    kernel::embeddingLookup(mRuntime.preprocess.idsInput, mRuntime.preprocess.embedding.table,
-        mRuntime.preprocess.embedding.scalesAsOptional(), mRuntime.base.pipelineIO.inputsEmbeds, context.stream);
+    kernel::embeddingLookup(mRuntime.preprocess.idsInput, mRuntime.preprocess.embedding.descriptor(),
+        mRuntime.base.pipelineIO.inputsEmbeds, context.stream);
     if (mRuntime.preprocess.gemma4Ple)
     {
-        mRuntime.preprocess.gemma4Ple->embed(mRuntime.preprocess.idsInput, context.stream);
+        mRuntime.preprocess.gemma4Ple->embed(
+            mRuntime.preprocess.idsInput, batch.hostTokenIds.dataPointer<int32_t>(), context.stream);
     }
     if (mRuntime.preprocess.gemma4Ple)
     {

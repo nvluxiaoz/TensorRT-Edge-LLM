@@ -218,7 +218,7 @@ def write_runtime_artifacts(cfg: DeviceConfig,
                                 "runtime loads it through its checkpoint "
                                 "binding")
                 else:
-                    write_ple_embedding(weights, cfg, output_dir)
+                    write_ple_embedding(weights, cfg, args, output_dir)
             extra_artifacts = getattr(weight_conversion,
                                       "runtime_weight_artifacts", None)
             if extra_artifacts is not None:

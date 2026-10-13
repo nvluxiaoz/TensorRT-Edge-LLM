@@ -77,7 +77,8 @@ def export_onnx(
     model: CausalLM,
     output_path: str,
     model_dir: str = "",
-    fp8_embedding: bool = False,
+    embedding_quantization: str = "fp16",
+    ple_quantization: str = "fp16",
     reduced_vocab_dir: str = "",
     externalize_weights=None,
     config_filename: str = "config.json",
@@ -94,8 +95,10 @@ def export_onnx(
         output_path: Destination ``.onnx`` file path.
         model_dir:   Checkpoint directory (for tokenizer file copying).
                      If empty, tokenizer files are skipped.
-        fp8_embedding: Quantize embedding.safetensors to FP8 E4M3 with
-                       per-row block scales.
+        embedding_quantization: ``embedding.safetensors`` format: ``fp16``,
+                                ``fp8``, ``int8``, ``int4``, or ``nvfp4``.
+        ple_quantization: ``ple_embedding.safetensors`` format for Gemma 4
+                          per-layer embeddings, with the same choices.
         reduced_vocab_dir: Directory containing ``vocab_map.safetensors``
                            when reduced vocabulary is enabled.
         externalize_weights: Iterable of weight kinds to expose as fixed-shape
@@ -128,7 +131,8 @@ def export_onnx(
     write_runtime_artifacts(model,
                             model_dir,
                             out_dir,
-                            fp8_embedding=fp8_embedding,
+                            embedding_quantization=embedding_quantization,
+                            ple_quantization=ple_quantization,
                             reduced_vocab_dir=reduced_vocab_dir,
                             config_filename=config_filename,
                             write_shared_artifacts=write_shared_artifacts)

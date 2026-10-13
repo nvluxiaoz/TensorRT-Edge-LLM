@@ -44,8 +44,12 @@ pytest.importorskip("modelopt.torch.quantization")
 pytest.importorskip("transformers")
 
 import modelopt.torch.quantization as mtq  # noqa: E402
+import numpy as np  # noqa: E402
 import torch  # noqa: E402
 import torch.nn as nn  # noqa: E402
+
+from tensorrt_edgellm.checkpoint import \
+    embedding_quantization as eq  # noqa: E402
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 _MODULE_PATH = os.path.normpath(
@@ -919,3 +923,164 @@ def test_vocoder_dir_copied_into_quantized_root():
         omni_mod._copy_vocoder_dir(same, same)
         assert os.path.isfile(
             os.path.join(same, "codec_decode_online", "model_weights.pt"))
+
+
+# --------------------------------------------------------------------------- #
+# Embedding / PLE sidecar quantization
+# --------------------------------------------------------------------------- #
+def _decode_sidecar_rows(data, scale, fmt, group, multiplier=1.0):
+    """Reference decode of quantize_rows output, independent of the encoder."""
+    if fmt in ("int4", "nvfp4"):
+        nibbles = np.empty((data.shape[0], data.shape[1] * 2), np.uint8)
+        nibbles[:, 0::2] = data & 0xF
+        nibbles[:, 1::2] = data >> 4
+    if fmt == "int8":
+        values = data.astype(np.float32)
+    elif fmt == "int4":
+        values = nibbles.astype(np.float32) - 8
+    elif fmt == "fp8":
+        values = torch.from_numpy(data.copy()).view(
+            torch.float8_e4m3fn).float().numpy()
+    else:
+        levels = np.array([0, 0.5, 1, 1.5, 2, 3, 4, 6], np.float32)
+        values = np.where(nibbles & 8, -1.0, 1.0) * levels[nibbles & 7]
+        scale = torch.from_numpy(scale.copy()).view(
+            torch.float8_e4m3fn).float().numpy()
+    return values * np.repeat(scale, group, axis=1) * multiplier
+
+
+@pytest.mark.parametrize("fmt, tolerance", [("fp8", 0.07), ("int8", 0.01),
+                                            ("int4", 0.15), ("nvfp4", 0.25)])
+def test_embedding_quantize_rows_round_trip(fmt, tolerance):
+    rng = np.random.default_rng(0)
+    table = rng.standard_normal((8, 512)).astype(np.float32)
+    group = eq.table_group_size(fmt, 512, 256)
+    multiplier = eq.nvfp4_global_scale(np.abs(table).max())
+    if fmt != "nvfp4":
+        multiplier = 1.0
+
+    data, scale = eq.quantize_rows(table, fmt, group, multiplier)
+
+    decoded = _decode_sidecar_rows(data, scale, fmt, group, multiplier)
+    error = np.abs(decoded - table).max(axis=1) / np.abs(table).max(axis=1)
+    assert error.max() < tolerance
+
+
+def test_embedding_quantize_rows_exact_packing():
+    # Given rows whose scales are 1, the stored codes are known exactly:
+    # INT8 rounds half to even, INT4 stores q + 8 and NVFP4 stores E2M1,
+    # both with the even column in the low nibble.
+    int8_row = np.zeros((1, 256), np.float32)
+    int8_row[0, :5] = [127, 0.5, 1.5, 2.5, -2.5]
+    int8, int8_scale = eq.quantize_rows(int8_row, "int8", 256)
+    int4_row = np.zeros((1, 128), np.float32)
+    int4_row[0, :2] = [7, -7]
+    int4, int4_scale = eq.quantize_rows(int4_row, "int4", 128)
+    nvfp4_row = np.zeros((1, 16), np.float32)
+    nvfp4_row[0, :2] = [6, -0.5]
+    nvfp4, block = eq.quantize_rows(nvfp4_row, "nvfp4", 16,
+                                    eq.nvfp4_global_scale(6.0))
+
+    assert int8[0, :5].tolist() == [127, 0, 2, 2, -2]
+    assert int8_scale.tolist() == [[1.0]]
+    assert int4[0, 0] == 0x1F and int4[0, 1] == 0x88
+    assert int4_scale.tolist() == [[1.0]]
+    assert nvfp4[0, 0] == 0x97 and block[0, 0] == 0x7E
+
+
+def test_fp8_embedding_encoding_matches_torch():
+    values = np.concatenate([
+        np.random.default_rng(1).standard_normal(4096) * 100,
+        np.arange(-1000, 1000, 0.125)
+    ]).astype(np.float32)
+    expected = torch.from_numpy(np.clip(values, -448, 448)).to(
+        torch.float8_e4m3fn).view(torch.uint8).numpy()
+
+    np.testing.assert_array_equal(eq.encode_fp8_e4m3(values), expected)
+
+
+@pytest.mark.parametrize("fmt", ["fp16", "fp8", "int8", "int4", "nvfp4"])
+def test_embedding_sidecar_streams_row_chunks(fmt, monkeypatch, tmp_path):
+    from safetensors import safe_open
+
+    rng = np.random.default_rng(2)
+    table = rng.standard_normal((40, 512)).astype(np.float32)
+    group = eq.table_group_size(fmt, 512, 256)
+    reads = []
+
+    def read_rows(start, stop):
+        reads.append((start, stop))
+        return table[start:stop]
+
+    # Force several chunks so every chunk lands at its own file offset.
+    monkeypatch.setattr(eq, "_CHUNK_BYTES", 512 * 16 * 7)
+    path = str(tmp_path / "ple_embedding.safetensors")
+    eq.write_quantized_table(path, "weight", table.shape, read_rows, fmt,
+                             group)
+
+    multiplier = (eq.nvfp4_global_scale(np.abs(table).max())
+                  if fmt == "nvfp4" else 1.0)
+    data, scale = eq.quantize_rows(table, fmt, group, multiplier)
+    with safe_open(path, framework="pt") as sidecar:
+        names = set(sidecar.keys())
+        stored = sidecar.get_tensor("weight")
+        metadata = sidecar.metadata() or {}
+        if fmt == "nvfp4":
+            stored_scale = sidecar.get_tensor("weight_block_scale")
+            stored_multiplier = sidecar.get_tensor("weight_multiplier_scale")
+        elif fmt != "fp16":
+            stored_scale = sidecar.get_tensor("weight_scale")
+    assert max(stop - start for start, stop in reads) == 7
+    if fmt in ("fp8", "nvfp4"):
+        stored = stored.view(torch.uint8)
+    np.testing.assert_array_equal(stored.numpy(), data)
+    if fmt == "fp16":
+        assert names == {"weight"}
+    elif fmt == "nvfp4":
+        assert names == {
+            "weight", "weight_block_scale", "weight_multiplier_scale"
+        }
+        np.testing.assert_array_equal(
+            stored_scale.view(torch.uint8).numpy(), scale)
+        assert stored_multiplier.tolist() == [np.float32(multiplier)]
+        assert json.loads(metadata[eq.EMBEDDING_DESCRIPTOR_METADATA_KEY]) == {
+            "logical_shape": [40, 512],
+            "group_size": 16
+        }
+    else:
+        assert names == {"weight", "weight_scale"}
+        np.testing.assert_array_equal(stored_scale.numpy(), scale)
+
+
+@pytest.mark.parametrize("plugin_version, packed_shape", [(1, (128, 128)),
+                                                          (2, (32, 512))])
+def test_int4_tied_lm_head_packs_embedding(plugin_version, packed_shape,
+                                           tmp_path):
+    from experimental.builder.core.artifacts.tensors import save_safetensors
+    from experimental.builder.core.weights import Weights
+    from experimental.builder.weight_packing import int4 as int4_pack
+
+    embedding = np.random.default_rng(3).standard_normal(
+        (256, 128)).astype(np.float16)
+    save_safetensors(str(tmp_path / "model.safetensors"),
+                     {"model.embed_tokens.weight": embedding})
+    weights = Weights(str(tmp_path),
+                      tie_word_embeddings=True,
+                      int4_lm_head=True,
+                      int4_gemm_plugin_version=plugin_version)
+    try:
+        head = weights.linear_descriptor("lm_head", "fp16")
+    finally:
+        weights.close()
+
+    grouped = embedding.astype(np.float32).reshape(256, 1, 128)
+    scales = (np.abs(grouped).max(axis=2) / 7).astype(np.float16)
+    nibbles = np.clip(np.rint(grouped / scales[..., None].astype(np.float32)),
+                      -7, 7).reshape(256, 128) + 8
+    assert head.quant_type == "int4_awq" and head.group_size == 128
+    assert (head.out_features, head.in_features) == (256, 128)
+    assert head.weight.shape == packed_shape
+    np.testing.assert_array_equal(head.weight_scale, scales.T)
+    np.testing.assert_array_equal(
+        head.weight,
+        int4_pack._pack_for_gemm(nibbles.astype(np.uint8), plugin_version))

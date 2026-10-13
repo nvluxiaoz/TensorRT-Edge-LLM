@@ -21,12 +21,14 @@ from collections import Counter
 from typing import Sequence
 
 from ..safetensors_np import SafetensorsStore
+from ..weight_policy import CHECKPOINT_BINDING_ENGINE_EMBEDDING
 from .embeddings import (embedding_binding, externalizes_embedding,
                          externalizes_ple, ple_embedding_binding)
 
 logger = logging.getLogger(__name__)
 
 _STORAGE_ALIAS_FIELD = "storage_alias_of"
+_LOOKUP_SCALE_FIELD = "lookup_scale"
 _CONTENT_IDENTITY_TENSOR_LIMIT = 16
 
 
@@ -48,7 +50,12 @@ def _materialization_contract(binding: dict) -> dict:
 
 def _share_tied_embedding(bindings: list[dict],
                           tie_word_embeddings: bool) -> None:
-    """Alias a runtime embedding to an identical engine weight input."""
+    """Alias a runtime embedding to an identical engine weight input.
+
+    The shared storage is unscaled, so the runtime-owned embedding carries its
+    scale as ``lookup_scale``, applied at lookup time. An embedding consumed
+    inside the engine needs materialized scaling and only aliases at scale 1.
+    """
     if not tie_word_embeddings:
         return
     candidates = [
@@ -59,7 +66,9 @@ def _share_tied_embedding(bindings: list[dict],
     for embedding in bindings:
         if embedding.get("role") != "embedding":
             continue
-        if float(embedding.get("embedding_scale", 1.0)) != 1.0:
+        scale = float(embedding.get("embedding_scale", 1.0))
+        if (scale != 1.0 and embedding["engine_name"]
+                != CHECKPOINT_BINDING_ENGINE_EMBEDDING):
             continue
         contract = _materialization_contract(embedding)
         matches = [
@@ -74,6 +83,9 @@ def _share_tied_embedding(bindings: list[dict],
         ))
         target = matches[0]["engine_name"]
         embedding[_STORAGE_ALIAS_FIELD] = target
+        if scale != 1.0:
+            del embedding["embedding_scale"]
+            embedding[_LOOKUP_SCALE_FIELD] = scale
         logger.info("Sharing tied embedding storage with %s", target)
 
 

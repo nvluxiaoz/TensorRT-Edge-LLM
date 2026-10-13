@@ -105,7 +105,9 @@ enum LLMInferenceOptionId : int
     DART_PIVOT_TEXT_TOKENS = 938,
     VISUAL_PRUNE_ALGO = 939,
     ENCODER_CACHE_BUDGET_BYTES = 940,
-    CP_SPEC_VERIFY_SIZE = 941
+    CP_SPEC_VERIFY_SIZE = 941,
+    PLE_RESIDENCY = 942,
+    PLE_FILE = 943
 };
 
 // Struct to hold speculative decoding arguments (used by both EAGLE and MTP)
@@ -144,6 +146,7 @@ struct LLMInferenceArgs
     std::string multimodalEngineDir{""};
     std::string checkpointDir{""};
     std::string draftCheckpointDir{""};
+    rt::PleRuntimeConfig pleConfig{};
     std::string inputFile;
     std::string outputFile{""};
     std::string profileOutputFile{""};
@@ -367,6 +370,12 @@ void printUsage(char const* programName)
     std::cerr << "  --checkpointDir           HF/ModelOpt checkpoint dir (required for runtime weight loading)"
               << std::endl;
     std::cerr << "  --draftCheckpointDir      Separate checkpoint for paired speculative drafts" << std::endl;
+    std::cerr << "  --pleResidency            Gemma 4 per-layer embedding storage: resident (default, GPU table) or"
+              << std::endl;
+    std::cerr << "                            cached (rows read from the source file per step; vanilla decoding only)"
+              << std::endl;
+    std::cerr << "  --pleFile                 Safetensors file holding the recorded PLE tensor (cached residency)"
+              << std::endl;
     std::cerr << "  --outputFile              Path to output JSON file (optional)" << std::endl;
     std::cerr << "  --dumpProfile             Dump profiling summary to console" << std::endl;
     std::cerr << "  --profileOutputFile       Path to profile JSON output file (optional)" << std::endl;
@@ -465,6 +474,8 @@ bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
         {"multimodalEngineDir", required_argument, 0, LLMInferenceOptionId::MULTIMODAL_ENGINE_DIR},
         {"checkpointDir", required_argument, 0, LLMInferenceOptionId::CHECKPOINT_DIR},
         {"draftCheckpointDir", required_argument, 0, LLMInferenceOptionId::DRAFT_CHECKPOINT_DIR},
+        {"pleResidency", required_argument, 0, LLMInferenceOptionId::PLE_RESIDENCY},
+        {"pleFile", required_argument, 0, LLMInferenceOptionId::PLE_FILE},
         {"outputFile", required_argument, 0, LLMInferenceOptionId::OUTPUT_FILE},
         {"debug", no_argument, 0, LLMInferenceOptionId::DEBUG},
         {"dumpProfile", no_argument, 0, LLMInferenceOptionId::DUMP_PROFILE},
@@ -521,6 +532,16 @@ bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
         case LLMInferenceOptionId::MULTIMODAL_ENGINE_DIR: args.multimodalEngineDir = optarg; break;
         case LLMInferenceOptionId::CHECKPOINT_DIR: args.checkpointDir = optarg; break;
         case LLMInferenceOptionId::DRAFT_CHECKPOINT_DIR: args.draftCheckpointDir = optarg; break;
+        case LLMInferenceOptionId::PLE_RESIDENCY:
+            if (std::string(optarg) != "resident" && std::string(optarg) != "cached")
+            {
+                LOG_ERROR("Invalid pleResidency value: %s (must be resident or cached)", optarg);
+                return false;
+            }
+            args.pleConfig.residency
+                = std::string(optarg) == "cached" ? rt::PleResidency::kCACHED : rt::PleResidency::kRESIDENT;
+            break;
+        case LLMInferenceOptionId::PLE_FILE: args.pleConfig.filePath = optarg; break;
         case LLMInferenceOptionId::OUTPUT_FILE: args.outputFile = optarg; break;
         case LLMInferenceOptionId::DEBUG: args.debug = true; break;
         case LLMInferenceOptionId::DUMP_PROFILE: args.dumpProfile = true; break;
@@ -1155,6 +1176,7 @@ int runParallelInference(LLMInferenceArgs const& args,
         runtimeConfig.parallelConfig = parallelConfig;
         runtimeConfig.checkpointDir = args.checkpointDir;
         runtimeConfig.draftCheckpointDir = args.draftCheckpointDir;
+        runtimeConfig.pleConfig = args.pleConfig;
         if (launchMode == rt::ParallelLaunchMode::kMpi)
         {
             runtimeConfig.localRanks = {processRank};
@@ -1607,9 +1629,9 @@ int main(int argc, char* argv[])
         draftingConfig.dsparkMaxProposalLen = args.specDecodeArgs.dsparkMaxProposalLen;
         try
         {
-            runtime
-                = std::make_unique<rt::LLMInferenceRuntime>(args.engineDir, args.multimodalEngineDir, loraWeightsMap,
-                    draftingConfig, stream, args.contextCacheConfig, args.checkpointDir, args.draftCheckpointDir);
+            runtime = std::make_unique<rt::LLMInferenceRuntime>(args.engineDir, args.multimodalEngineDir,
+                loraWeightsMap, draftingConfig, stream, args.contextCacheConfig, args.checkpointDir,
+                args.draftCheckpointDir, args.pleConfig);
         }
         catch (std::exception const& e)
         {
@@ -1624,7 +1646,7 @@ int main(int argc, char* argv[])
         try
         {
             runtime = std::make_unique<rt::LLMInferenceRuntime>(args.engineDir, args.multimodalEngineDir,
-                loraWeightsMap, stream, args.contextCacheConfig, args.checkpointDir);
+                loraWeightsMap, stream, args.contextCacheConfig, args.checkpointDir, args.pleConfig);
         }
         catch (std::exception const& e)
         {

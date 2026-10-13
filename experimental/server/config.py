@@ -20,6 +20,9 @@ import math
 from dataclasses import dataclass, field
 from typing import Any, Dict, Mapping, Optional, Sequence, Union
 
+from tensorrt_edgellm.checkpoint.embedding_quantization import \
+    EMBEDDING_FORMATS as _TABLE_FORMATS
+
 _INT32_MAX = 2**31 - 1
 _INT64_MAX = 2**63 - 1
 
@@ -187,6 +190,11 @@ class ModelConfig:
     context_cache_config: ContextCacheConfig = field(
         default_factory=ContextCacheConfig)
     enable_in_flight_batching: bool = False
+    embedding_quantization: str = "fp16"
+    ple_quantization: str = "fp16"
+    lm_head_quantization: str = "fp16"
+    ple_residency: str = "resident"
+    ple_file: str = ""
 
     def __post_init__(self) -> None:
         if (isinstance(self.engine_cache_max_size_gb, bool)
@@ -214,6 +222,11 @@ class ModelConfig:
             "speculative_config": self.speculative_config,
             "context_cache_config": self.context_cache_config,
             "enable_in_flight_batching": self.enable_in_flight_batching,
+            "embedding_quantization": self.embedding_quantization,
+            "ple_quantization": self.ple_quantization,
+            "lm_head_quantization": self.lm_head_quantization,
+            "ple_residency": self.ple_residency,
+            "ple_file": self.ple_file,
         }
 
 
@@ -361,6 +374,38 @@ def create_argument_parser() -> argparse.ArgumentParser:
         "standalone TTS deployment refuses the flag at startup, and a "
         "Qwen3-Omni bundle serves text only (its speech endpoints refuse).",
     )
+    model.add_argument(
+        "--embedding-quantization",
+        choices=_TABLE_FORMATS,
+        default="fp16",
+        help="Token embedding table format written at build time.",
+    )
+    model.add_argument(
+        "--ple-quantization",
+        choices=_TABLE_FORMATS,
+        default="fp16",
+        help="Gemma 4 per-layer embedding table format written at build time.",
+    )
+    model.add_argument(
+        "--lm-head-quantization",
+        choices=("fp16", "int4"),
+        default="fp16",
+        help="int4 quantizes a tied embedding head into the engine.",
+    )
+    model.add_argument(
+        "--ple-residency",
+        choices=("resident", "cached"),
+        default="resident",
+        help="Gemma 4 per-layer embedding storage: resident keeps the table "
+        "in GPU memory; cached reads the rows of each step from the source "
+        "file through the OS page cache (vanilla decoding only).",
+    )
+    model.add_argument(
+        "--ple-file",
+        default="",
+        help="Safetensors file holding the recorded per-layer embedding "
+        "tensor, read instead of the checkpoint in cached residency.",
+    )
     model.add_argument("--context-cache-max-records",
                        type=_non_negative_int,
                        default=1024)
@@ -413,6 +458,11 @@ def parse_server_config(argv: Optional[Sequence[str]] = None) -> ServerConfig:
         speculative_config=speculative,
         context_cache_config=context_cache,
         enable_in_flight_batching=args.enable_in_flight_batching,
+        embedding_quantization=args.embedding_quantization,
+        ple_quantization=args.ple_quantization,
+        lm_head_quantization=args.lm_head_quantization,
+        ple_residency=args.ple_residency,
+        ple_file=args.ple_file,
     )
     api = ApiConfig(
         host=args.host,

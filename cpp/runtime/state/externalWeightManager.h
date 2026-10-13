@@ -18,6 +18,7 @@
 #pragma once
 
 #include "common/tensor.h"
+#include "runtime/config/pleRuntimeConfig.h"
 #include "runtime/exec/tensorMap.h"
 
 #include <cuda_runtime.h>
@@ -32,6 +33,7 @@ namespace rt
 {
 
 class EngineExecutor;
+struct EmbeddingData;
 
 //! Owns immutable, final-layout model weights prepared during initialization.
 //!
@@ -60,9 +62,12 @@ public:
     //!
     //! The stream is synchronized before this method returns, leaving only
     //! engine-input tensors and plugin resources in their final layouts.
+    //!
+    //! With pleOnDisk, a checkpoint-backed PLE binding is located but not materialized.
     void load(std::filesystem::path const& engineDir, std::filesystem::path const& configPath, cudaStream_t stream,
         std::filesystem::path const& componentCheckpointDir = {}, std::filesystem::path const& targetCheckpointDir = {},
-        std::optional<int32_t> tpRank = std::nullopt, std::optional<int32_t> tpSize = std::nullopt);
+        std::optional<int32_t> tpRank = std::nullopt, std::optional<int32_t> tpSize = std::nullopt,
+        bool pleOnDisk = false);
 
     void validateAgainstEngine(EngineExecutor const& executor, std::string_view engineLabel);
 
@@ -76,11 +81,14 @@ public:
     void bindToContext(
         nvinfer1::ICudaEngine const& engine, nvinfer1::IExecutionContext& context, std::string_view engineLabel);
 
-    //! Transfer the checkpoint-backed embedding prepared during load(), if any.
-    std::optional<Tensor> takeEmbedding();
+    //! Transfer the checkpoint-backed embedding prepared during load() and its lookup multiplier, if any.
+    std::optional<EmbeddingData> takeEmbedding();
 
     //! Transfer the checkpoint-backed Gemma4 PLE table, if any.
     std::optional<Tensor> takePleEmbedding();
+
+    //! Transfer the checkpoint location of a PLE binding left on disk by load(), if any.
+    std::optional<PleFileSource> takePleFileSource();
 
     size_t size() const noexcept
     {
@@ -104,7 +112,9 @@ private:
     std::vector<Tensor> mPluginResourceTensors{};
     std::vector<PluginResourceRegistration> mPluginResourceRegistrations{};
     std::optional<Tensor> mEmbedding{};
+    float mEmbeddingLookupScale{1.0F};
     std::optional<Tensor> mPleEmbedding{};
+    std::optional<PleFileSource> mPleFileSource{};
     bool mLoaded{false};
     bool mValidated{false};
     bool mRegistered{false};

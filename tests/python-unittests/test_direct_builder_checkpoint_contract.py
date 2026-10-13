@@ -151,12 +151,17 @@ def test_checkpoint_identity_sampling_cost_is_model_bounded(
 def test_embedding_alias_requires_model_tying(tied, aliases):
     bindings = [
         _binding("lm_head.weight"),
-        _binding("__embedding__", role="embedding", embedding_scale=1.0),
+        _binding("__embedding__", role="embedding", embedding_scale=39.1875),
     ]
 
     _share_tied_embedding(bindings, tied)
 
-    assert (bindings[1].get("storage_alias_of") == "lm_head.weight") is aliases
+    # The shared table stays unscaled; an alias applies its scale at lookup.
+    embedding = bindings[1]
+    assert (embedding.get("storage_alias_of") == "lm_head.weight") is aliases
+    assert ("embedding_scale" in embedding) is not aliases
+    assert embedding.get("lookup_scale",
+                         embedding.get("embedding_scale")) == 39.1875
 
 
 @pytest.mark.parametrize(
@@ -164,7 +169,9 @@ def test_embedding_alias_requires_model_tying(tied, aliases):
     [
         (
             _binding("lm_head.weight"),
-            _binding("__embedding__", role="embedding", embedding_scale=2.0),
+            _binding("model.embed_tokens.weight",
+                     role="embedding",
+                     embedding_scale=2.0),
         ),
         (
             _binding("lm_head.weight", embedding_scale=2.0),

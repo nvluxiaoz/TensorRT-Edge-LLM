@@ -139,15 +139,15 @@ Without this setting, export uses the SM100/SM101/SM110 layout. The selected
 weight layout is fixed in the exported artifacts and cannot be changed during
 engine build or inference. Use a separate export directory for each layout.
 
-## Quantize Embedding Table To FP8
+## Quantize Embedding Tables
 
-FP8 embedding quantization is applied at export time via `tensorrt_edgellm`, not during the quantization step. Pass `--fp8-embedding` when exporting the quantized checkpoint. See [FP8 Embedding](fp8-embedding.md) for details and usage examples. Export the runtime embedding table in FP8:
+Embedding tables are quantized at export or engine-build time, not during the quantization step. Pass `--embedding-quantization {fp8,int8,int4,nvfp4}` (and `--ple-quantization` for Gemma 4 per-layer embeddings) when exporting the quantized checkpoint; `--fp8-embedding` is an alias for `--embedding-quantization fp8`. See [Embedding Quantization](fp8-embedding.md) for the formats.
 
 ```bash
 tensorrt-edgellm-export \
   /tmp/qwen35_nvfp4 \
   /tmp/qwen35_onnx \
-  --fp8-embedding
+  --embedding-quantization fp8
 ```
 
 ## Supported Methods

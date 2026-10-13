@@ -371,8 +371,8 @@ bool DFlashDecoder::runDraftForward(DecodingInferenceContext& context)
     // Step 2: Embed the draft inputs.
     check::check(
         mDraftInputsEmbeds.reshape({activeBatchSize, BS, mBlockDraft.draftHiddenSize}), "Tensor reshape failed");
-    kernel::embeddingLookup(mRuntime.preprocess.idsInput, mRuntime.preprocess.embedding.table,
-        mRuntime.preprocess.embedding.scalesAsOptional(), mDraftInputsEmbeds, context.stream);
+    kernel::embeddingLookup(
+        mRuntime.preprocess.idsInput, mRuntime.preprocess.embedding.descriptor(), mDraftInputsEmbeds, context.stream);
 
     // Step 3: Prepare target-hidden delta from base hidden states.
     // Round 0 uses prefill hidden states; later rounds use accepted base hidden states.
@@ -1012,8 +1012,8 @@ void DFlashDecoder::runBaseVerificationEmbeddingLookup(
     check::check(
         mRuntime.base.pipelineIO.inputsEmbeds.reshape({batchSize, verifySize, mRuntime.deployment.base.hiddenSize}),
         "Tensor reshape failed");
-    kernel::embeddingLookup(mRuntime.preprocess.idsInput, mRuntime.preprocess.embedding.table,
-        mRuntime.preprocess.embedding.scalesAsOptional(), mRuntime.base.pipelineIO.inputsEmbeds, stream);
+    kernel::embeddingLookup(mRuntime.preprocess.idsInput, mRuntime.preprocess.embedding.descriptor(),
+        mRuntime.base.pipelineIO.inputsEmbeds, stream);
     if (reshapeGemmaPleOutputs && mRuntime.preprocess.gemma4Ple)
     {
         mRuntime.preprocess.gemma4Ple->reshapeOutputsTokenMajor(batchSize * verifySize);
@@ -1318,8 +1318,8 @@ bool DFlashDecoder::runSystemPromptPrefill(DecodingInferenceContext& context)
 
     check::check(
         mDraftInputsEmbeds.reshape({activeBatchSize, BS, mBlockDraft.draftHiddenSize}), "Tensor reshape failed");
-    kernel::embeddingLookup(mRuntime.preprocess.idsInput, mRuntime.preprocess.embedding.table,
-        mRuntime.preprocess.embedding.scalesAsOptional(), mDraftInputsEmbeds, context.stream);
+    kernel::embeddingLookup(
+        mRuntime.preprocess.idsInput, mRuntime.preprocess.embedding.descriptor(), mDraftInputsEmbeds, context.stream);
 
     bindTargetHiddenDelta(activeBatchSize, prefillLen, prefillLen, /*allowLargeDelta=*/true, context.stream);
 

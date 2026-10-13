@@ -19,6 +19,7 @@
 
 #include "common/tensor.h"
 #include "runtime/config/deploymentConfig.h"
+#include "runtime/config/pleRuntimeConfig.h"
 #include "runtime/exec/engineExecutor.h"
 #include "runtime/llmRuntimeUtils.h"
 #include "runtime/state/externalWeightManager.h"
@@ -56,6 +57,8 @@ struct ModelArtifacts
     EmbeddingData embedding;
     std::optional<Tensor> pleEmbedding; //!< Gemma4 per-layer embedding; absent unless the base engine enables PLE.
     std::optional<Tensor> vocabMap;     //!< Reduced-vocab mapping table; absent unless the base vocab is reduced.
+    PleRuntimeConfig pleConfig;
+    std::optional<PleFileSource> pleFileSource; //!< Checkpoint PLE rows left on disk in cached residency.
     std::unique_ptr<tokenizer::Tokenizer> tokenizer;
 
     //! Checkpoint directories that supplied `weights`. Retained because encoder runners load from them separately.
@@ -68,7 +71,8 @@ struct ModelArtifacts
     //! returned artifacts record it as equal to `checkpointDir` in that case.
     static ModelArtifacts loadFromEngineDir(std::filesystem::path const& engineDir,
         std::optional<SpecDecodeDraftingConfig> const& draftingConfig, std::filesystem::path const& checkpointDir,
-        std::filesystem::path const& draftCheckpointDir, bool contextReuseEnabled, cudaStream_t stream);
+        std::filesystem::path const& draftCheckpointDir, bool contextReuseEnabled, cudaStream_t stream,
+        PleRuntimeConfig const& pleConfig = {});
 };
 
 } // namespace rt

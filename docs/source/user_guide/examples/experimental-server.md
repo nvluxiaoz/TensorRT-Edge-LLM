@@ -92,6 +92,19 @@ downloaded checkpoints. Moving or copying an unchanged checkpoint does not
 invalidate its cached bundle. Python callers can perform cache maintenance with
 `experimental.server.clear_engine_cache()` and `prune_engine_cache()`.
 
+`--embedding-quantization`, `--ple-quantization`, and `--lm-head-quantization`
+are passed to the build and are part of the bundle profile. See
+[Embedding Quantization](../features/fp8-embedding.md).
+
+Gemma 4 per-layer embeddings (PLE) are GPU-resident by default
+(`--ple-residency resident`). `--ple-residency cached` keeps the F16 or BF16
+PLE table in its checkpoint file and reads only the rows of each step through
+the OS page cache, which saves the whole table (4.4 GiB for Gemma 4 E2B) of
+device memory; use it on 8 GB devices. `--ple-file` reads the same tensor from
+another safetensors file, for example a copy on faster storage. Cached
+residency supports single-rank vanilla decoding only, and the source file must
+stay unchanged while the server runs.
+
 ## Speculative Decoding
 
 `--speculative-config` accepts `method`, `model`, and

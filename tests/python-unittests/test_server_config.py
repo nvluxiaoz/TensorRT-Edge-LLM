@@ -135,6 +135,28 @@ def test_maps_model_cache_and_build_profile(tmp_path):
     assert config.api.enable_auto_tool_choice
 
 
+def test_table_and_ple_options_reach_the_llm_kwargs():
+    config = parse_server_config([
+        "google/gemma-4-E2B-it",
+        "--embedding-quantization",
+        "int8",
+        "--ple-quantization",
+        "int4",
+        "--lm-head-quantization",
+        "int4",
+        "--ple-residency",
+        "cached",
+        "--ple-file",
+        "/data/ple.safetensors",
+    ])
+    kwargs = config.model.llm_kwargs()
+    assert kwargs["embedding_quantization"] == "int8"
+    assert kwargs["ple_quantization"] == "int4"
+    assert kwargs["lm_head_quantization"] == "int4"
+    assert kwargs["ple_residency"] == "cached"
+    assert kwargs["ple_file"] == "/data/ple.safetensors"
+
+
 def test_context_cache_config_rejects_ignored_or_invalid_options():
     with pytest.raises(ServerConfigError, match="tuning requires"):
         ContextCacheConfig(recurrent_snapshot_pool_bytes=1)

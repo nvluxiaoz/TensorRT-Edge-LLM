@@ -65,6 +65,7 @@ public:
         ContextCacheConfig contextCacheConfig{};
         std::string checkpointDir{};
         std::string draftCheckpointDir{};
+        PleRuntimeConfig pleConfig{};
         std::vector<int32_t> localRanks{};
         std::unordered_map<int32_t, int32_t> localRankDevices{};
         std::vector<cudaStream_t> localStreams{};
@@ -76,11 +77,12 @@ public:
         std::unordered_map<std::string, std::string> const& loraWeightsMap,
         SpecDecodeDraftingConfig const& draftingConfig, cudaStream_t stream,
         ContextCacheConfig const& contextCacheConfig = {}, std::string const& checkpointDir = "",
-        std::string const& draftCheckpointDir = "");
+        std::string const& draftCheckpointDir = "", PleRuntimeConfig const& pleConfig = {});
 
     LLMInferenceRuntime(std::string const& engineDir, std::string const& multimodalEngineDir,
         std::unordered_map<std::string, std::string> const& loraWeightsMap, cudaStream_t stream,
-        ContextCacheConfig const& contextCacheConfig = {}, std::string const& checkpointDir = "");
+        ContextCacheConfig const& contextCacheConfig = {}, std::string const& checkpointDir = "",
+        PleRuntimeConfig const& pleConfig = {});
 
     LLMInferenceRuntime(std::string const& engineDir, std::string const& multimodalEngineDir,
         std::unordered_map<std::string, std::string> const& loraWeightsMap, ParallelExecutionConfig config);

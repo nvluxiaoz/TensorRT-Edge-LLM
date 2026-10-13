@@ -31,6 +31,8 @@ from typing import Iterator, Optional, Tuple
 import numpy as np
 import tensorrt as trt
 
+from tensorrt_edgellm.checkpoint.embedding_quantization import \
+    EMBEDDING_FORMATS
 from tensorrt_edgellm.dflash import DFlashVersion
 
 from ..ops.backend import Net
@@ -149,7 +151,9 @@ class BuildArgs:
     draft_reduced_vocab_dir: str = ""
     draft_model_dir: str = ""
     target_model_dir: str = ""
-    fp8_embedding: bool = False
+    embedding_quantization: str = "fp16"
+    ple_quantization: str = "fp16"
+    lm_head_quantization: str = "fp16"
     plugin_path: Optional[str] = None
     profiling_detailed: bool = False
     dense_quant: str = "auto"  # auto | nvfp4-qdq | fp16
@@ -194,7 +198,7 @@ class BuildArgs:
                 weight_policy.EXTERNAL_WEIGHT_NVFP4_MOE,
             )
             policy = policy.without(unsupported_tp, strict=tp_strict)
-        if self.fp8_embedding:
+        if self.embedding_quantization != "fp16":
             policy = policy.without(
                 (weight_policy.EXTERNAL_WEIGHT_EMBEDDING, ), strict=strict)
         vocab_dir = (self.draft_reduced_vocab_dir if self.resolved_spec_role
@@ -311,8 +315,24 @@ class BuildArgs:
             raise ValueError(
                 "DFlash V2 verify and draft profile sizes must match in [2, 16]"
             )
-        if self.fp8_embedding and self.resolved_spec_role == contracts.SpecRole.DRAFT:
+        for flag, value in (
+            ("--embedding-quantization", self.embedding_quantization),
+            ("--ple-quantization", self.ple_quantization),
+        ):
+            if value not in EMBEDDING_FORMATS:
+                raise ValueError(
+                    f"{flag} must be one of "
+                    f"{', '.join(EMBEDDING_FORMATS)}, got {value!r}")
+        if (self.embedding_quantization != "fp16"
+                and self.resolved_spec_role == contracts.SpecRole.DRAFT):
             raise ValueError("draft engines use the base embedding sidecar")
+        if self.lm_head_quantization not in ("fp16", "int4"):
+            raise ValueError("--lm-head-quantization must be fp16 or int4, "
+                             f"got {self.lm_head_quantization!r}")
+        if self.lm_head_quantization == "int4" and (self.reduced_vocab_dir
+                                                    or self.tp_size > 1):
+            raise ValueError("--lm-head-quantization int4 does not support "
+                             "--reduced-vocab-dir or --tp-size > 1")
 
 
 @dataclass(frozen=True)
@@ -447,6 +467,13 @@ def _build_engine(args: BuildArgs, cfg: Optional[DeviceConfig],
     if policy.bake_lm_head and requested_policy.externalizes_fp16("lm_head"):
         logger.info("Keeping the LM head in the engine; a reduced vocabulary "
                     "rewrites it")
+    # The INT4 head applies to the target model; drafts keep their own head.
+    int4_lm_head = (args.lm_head_quantization == "int4"
+                    and args.resolved_component == contracts.Component.LLM
+                    and args.resolved_spec_role != contracts.SpecRole.DRAFT)
+    if int4_lm_head and not (cfg and cfg.tie_word_embeddings):
+        raise ValueError("--lm-head-quantization int4 quantizes a tied "
+                         "embedding head; this model has an untied lm_head")
     weights = Weights(args.model_dir,
                       group_size=component_quant.group_size,
                       quant=component_quant,
@@ -458,6 +485,7 @@ def _build_engine(args: BuildArgs, cfg: Optional[DeviceConfig],
                       int4_gemm_plugin_version=args.int4_gemm_plugin_version,
                       tie_word_embeddings=bool(cfg
                                                and cfg.tie_word_embeddings),
+                      int4_lm_head=int4_lm_head,
                       policy=policy)
     net = Net(builder,
               network,

@@ -108,6 +108,17 @@ def test_builder_argv_builds_every_component():
     assert "--externalize-weights" not in argv
 
 
+def test_builder_argv_forwards_table_precisions():
+    options = BuildOptions(embedding_quantization="int8",
+                           ple_quantization="int4",
+                           lm_head_quantization="int4")
+    argv = options.to_argv("base", "bundle")
+    assert argv[argv.index("--embedding-quantization") + 1] == "int8"
+    assert argv[argv.index("--ple-quantization") + 1] == "int4"
+    assert argv[argv.index("--lm-head-quantization") + 1] == "int4"
+    assert "--ple-quantization" not in BuildOptions().to_argv("base", "bundle")
+
+
 def test_cache_path_binds_checkpoint_and_profile(tmp_path):
     checkpoint = _checkpoint(tmp_path / "checkpoint")
     cache = str(tmp_path / "cache")
@@ -237,7 +248,7 @@ def test_model_source_rejects_cache_artifacts_and_onnx(tmp_path):
 
 class _FakeRuntime:
 
-    def __init__(self, *args):
+    def __init__(self, *args, **kwargs):
         self.args = args
 
     def capture_decoding_cuda_graph(self):

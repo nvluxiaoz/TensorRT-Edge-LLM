@@ -168,8 +168,9 @@ describes them:
 |---|---|
 | FP8 and MXFP8 | Their Q/DQ constants are folded into the graph by design |
 | A reduced-vocabulary LM head | The head is rewritten at build time |
+| An INT4 tied LM head (`--lm-head-quantization int4`) | Quantized at build time |
 | Tensor-parallel model weights outside the fused NVFP4 plugin | Their TensorRT/Myelin layouts are selected at build time |
-| The FP8 embedding table (`--fp8-embedding`) | Quantized at build time |
+| Quantized embedding tables (`--embedding-quantization`, `--ple-quantization`) | Quantized at build time |
 | Padded or fused MoE expert banks | No per-expert checkpoint layout to repack |
 | A visual patch embedding | Folded into the graph as a small constant |
 | Derived Code2Wav codebooks | Computed from checkpoint statistics at build time |
