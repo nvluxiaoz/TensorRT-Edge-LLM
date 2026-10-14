@@ -187,6 +187,9 @@ class ModelConfig:
     context_cache_config: ContextCacheConfig = field(
         default_factory=ContextCacheConfig)
     enable_in_flight_batching: bool = False
+    embedding_quantization: str = "fp16"
+    lm_head_quantization: str = "fp16"
+    ple_residency: str = "resident"
 
     def __post_init__(self) -> None:
         if (isinstance(self.engine_cache_max_size_gb, bool)
@@ -214,6 +217,9 @@ class ModelConfig:
             "speculative_config": self.speculative_config,
             "context_cache_config": self.context_cache_config,
             "enable_in_flight_batching": self.enable_in_flight_batching,
+            "embedding_quantization": self.embedding_quantization,
+            "lm_head_quantization": self.lm_head_quantization,
+            "ple_residency": self.ple_residency,
         }
 
 
@@ -361,6 +367,25 @@ def create_argument_parser() -> argparse.ArgumentParser:
         "standalone TTS deployment refuses the flag at startup, and a "
         "Qwen3-Omni bundle serves text only (its speech endpoints refuse).",
     )
+    model.add_argument(
+        "--embedding-quantization",
+        choices=("fp16", "int8"),
+        default="fp16",
+        help="int8 stores the token embedding with one scale per row.",
+    )
+    model.add_argument(
+        "--lm-head-quantization",
+        choices=("fp16", "int4"),
+        default="fp16",
+        help="int4 quantizes a tied embedding head at build time.",
+    )
+    model.add_argument(
+        "--ple-residency",
+        choices=("resident", "cached"),
+        default="resident",
+        help="Gemma 4 per-layer embedding: resident keeps the table on the "
+        "GPU, cached reads the rows of each step from the checkpoint.",
+    )
     model.add_argument("--context-cache-max-records",
                        type=_non_negative_int,
                        default=1024)
@@ -413,6 +438,9 @@ def parse_server_config(argv: Optional[Sequence[str]] = None) -> ServerConfig:
         speculative_config=speculative,
         context_cache_config=context_cache,
         enable_in_flight_batching=args.enable_in_flight_batching,
+        embedding_quantization=args.embedding_quantization,
+        lm_head_quantization=args.lm_head_quantization,
+        ple_residency=args.ple_residency,
     )
     api = ApiConfig(
         host=args.host,

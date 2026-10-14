@@ -79,6 +79,44 @@ def _text_calib_dataloader(tokenizer,
     return DataLoader(enc["input_ids"], batch_size=batch_size, shuffle=False)
 
 
+def _packed_text_calib_dataloader(tokenizer, text_dataset: TextDataset,
+                                  batch_size: int, num_samples: int,
+                                  seq_len: int):
+    """Return ``num_samples`` unpadded blocks of ``seq_len`` tokens.
+
+    Each block is BOS followed by consecutive documents, so no pad tokens
+    reach calibration.
+    """
+    stream, blocks = [], []
+    for text in text_dataset():
+        stream += tokenizer(text, add_special_tokens=False)["input_ids"]
+        while len(stream) >= seq_len - 1 and len(blocks) < num_samples:
+            blocks.append([tokenizer.bos_token_id] + stream[:seq_len - 1])
+            del stream[:seq_len - 1]
+        if len(blocks) == num_samples:
+            return DataLoader(torch.tensor(blocks),
+                              batch_size=batch_size,
+                              shuffle=False)
+    raise ValueError(
+        f"Text calibration dataset {dataset_name(text_dataset)!r} holds only "
+        f"{len(blocks)} blocks of {seq_len} tokens; {num_samples} requested.")
+
+
+def _restore_gemma4_global_attention_config(model_dir: str,
+                                            output_dir: str) -> None:
+    """Copy the global-attention keys that transformers 5.17 drops on save."""
+    with open(os.path.join(model_dir, "config.json")) as f:
+        source = json.load(f).get("text_config", {})
+    path = os.path.join(output_dir, "config.json")
+    with open(path) as f:
+        saved = json.load(f)
+    for key in ("global_head_dim", "num_global_key_value_heads"):
+        if key in source:
+            saved["text_config"][key] = source[key]
+    with open(path, "w") as f:
+        json.dump(saved, f, indent=2)
+
+
 def _is_nemotron_h_model(model_dir: str) -> bool:
     """True if ``<model_dir>/config.json`` declares ``model_type == "nemotron_h"``."""
     config_path = os.path.join(model_dir, "config.json")
@@ -910,6 +948,8 @@ def quantize_and_export(
     num_samples: int = 512,
     fuse_gdn_qkvzba_scales: bool = False,
     quantize_gemma4_down_proj: bool = False,
+    awq_full: bool = False,
+    calib_seq_len: Optional[int] = None,
 ) -> str:
     """Load a HuggingFace model, quantize it, and export a unified checkpoint.
 
@@ -1090,6 +1130,10 @@ def quantize_and_export(
             cp_quantization=cp_quantization,
             fuse_gdn_qkvzba_scales=fuse_gdn_qkvzba_scales,
         )
+        if awq_full:
+            if quantization != "int4_awq":
+                raise ValueError("--awq_full requires --quantization int4_awq")
+            quant_cfg["algorithm"] = {"method": "awq_full", "alpha_step": 0.1}
         # When INT4 is exported to the cuteDSL GEMM kernel's fragment layout, repack
         # requires N%64==0 && K%64==0. Small hybrid/GDN projections (e.g. Qwen3.5
         # in_proj_a / in_proj_b with out_features=16/32) cannot be repacked, so
@@ -1110,11 +1154,10 @@ def quantize_and_export(
                         f"[int4] skipping {name}: weight [{module.out_features}, "
                         f"{module.in_features}] not 64-aligned (kept fp16)")
             append_quant_cfg_entries(quant_cfg, int4_excludes)
-        # Gemma4 text backbone: 4-bit down_proj cannot represent the clamped
-        # +/-2048 GeGLU intermediate and drops mmlu/mmmu below threshold; keep
-        # it fp16. Scoped by module name so the vision/audio towers keep their
-        # requested precision.
-        if (not quantize_gemma4_down_proj
+        # Gemma4 text backbone: down_proj stays fp16 unless forced, or unless
+        # awq_full recovers its accuracy under INT4. Scoped by module name so
+        # the vision/audio towers keep their requested precision.
+        if (not quantize_gemma4_down_proj and not awq_full
                 and quantization in ("int4_awq", "nvfp4")
                 and _get_model_type(model_dir).startswith("gemma4")):
             gemma4_excludes = []
@@ -1131,6 +1174,19 @@ def quantize_and_export(
                         "enable": False,
                     })
             append_quant_cfg_entries(quant_cfg, gemma4_excludes)
+        # The per-layer embedding gate and projection are tiny; INT4 costs accuracy there.
+        if (quantization == "int4_awq"
+                and _get_model_type(model_dir).startswith("gemma4")):
+            per_layer_excludes = []
+            for name, module in model.named_modules():
+                if (isinstance(module, torch.nn.Linear) and name.endswith(
+                    ("per_layer_input_gate", "per_layer_projection"))):
+                    for kind in ("weight", "input"):
+                        per_layer_excludes.append({
+                            "quantizer_name": f"*{name}.{kind}_quantizer",
+                            "enable": False,
+                        })
+            append_quant_cfg_entries(quant_cfg, per_layer_excludes)
         if kv_cache_quantization is not None and _is_phi4mm_model(model_dir):
             _pre_register_phi4mm_attention_for_kv_quant(model)
         if cp_quantization is not None and is_qwen3_next_omni(model):
@@ -1235,7 +1291,8 @@ def quantize_and_export(
                 quant_cfg,
                 forward_loop=lambda m: _calibrate_multimodal(m, batches))
         elif (visual_quantization is not None
-              or _is_image_blind_calibration(model, quant_cfg)):
+              or (calib_seq_len is None
+                  and _is_image_blind_calibration(model, quant_cfg))):
             image_ds = resolve_dataset(image_dataset, "image")
             print(f"Image calibration dataset: {dataset_name(image_ds)}")
             # Multimodal calibration: feed (image, text) pairs through the
@@ -1270,10 +1327,15 @@ def quantize_and_export(
             text_ds = resolve_dataset(text_dataset, "text")
             print(f"Text calibration dataset: {dataset_name(text_ds)}")
             batch_size = 16 if quantization in (None, "int4_awq") else 1
-            loader = _text_calib_dataloader(tokenizer,
-                                            text_ds,
-                                            batch_size=batch_size,
-                                            num_samples=num_samples)
+            if calib_seq_len is not None:
+                loader = _packed_text_calib_dataloader(
+                    tokenizer, text_ds, max(1, 4096 // calib_seq_len),
+                    num_samples, calib_seq_len)
+            else:
+                loader = _text_calib_dataloader(tokenizer,
+                                                text_ds,
+                                                batch_size=batch_size,
+                                                num_samples=num_samples)
             mtq.quantize(model,
                          quant_cfg,
                          forward_loop=lambda m: _calibrate(m, loader))
@@ -1335,6 +1397,8 @@ def quantize_and_export(
             print("Exported calibrated Q-BMM scales for "
                   f"{len(attention_q_scales)} attention layer(s).")
     _remove_stale_safetensors_index(output_dir)
+    if _get_model_type(model_dir).startswith("gemma4"):
+        _restore_gemma4_global_attention_config(model_dir, output_dir)
     tokenizer.save_pretrained(output_dir)
     if processor is not None:
         if _is_phi4mm_model(model_dir):

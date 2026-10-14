@@ -108,6 +108,27 @@ def test_builder_argv_builds_every_component():
     assert "--externalize-weights" not in argv
 
 
+def test_gemma4_memory_options_reach_builder_and_cache_key(tmp_path):
+    options = BuildOptions(lm_head_quantization="int4",
+                           ple_residency="cached",
+                           embedding_quantization="int8")
+    argv = options.to_argv("base", "bundle")
+    assert argv[argv.index("--lm-head-quantization") + 1] == "int4"
+    assert argv[argv.index("--ple-residency") + 1] == "cached"
+    assert argv[argv.index("--embedding-quantization") + 1] == "int8"
+    defaults = BuildOptions().to_argv("base", "bundle")
+    assert "--lm-head-quantization" not in defaults
+    assert "--ple-residency" not in defaults
+    assert "--embedding-quantization" not in defaults
+
+    checkpoint = _checkpoint(tmp_path / "checkpoint")
+    cache = str(tmp_path / "cache")
+    assert engine_build.bundle_cache_path(
+        str(checkpoint), cache,
+        options) != engine_build.bundle_cache_path(str(checkpoint), cache,
+                                                   BuildOptions())
+
+
 def test_cache_path_binds_checkpoint_and_profile(tmp_path):
     checkpoint = _checkpoint(tmp_path / "checkpoint")
     cache = str(tmp_path / "cache")

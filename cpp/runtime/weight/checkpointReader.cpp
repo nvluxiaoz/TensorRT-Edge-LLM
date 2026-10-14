@@ -458,5 +458,13 @@ bool CheckpointReader::find(std::string const& name, View& view) const
     return true;
 }
 
+std::pair<std::filesystem::path, size_t> CheckpointReader::locate(std::string const& name) const
+{
+    auto const location = mTensorShards.find(name);
+    ELLM_CHECK(location != mTensorShards.end(), "Checkpoint tensor not found: " + name);
+    Shard const& shard = openShard(location->second);
+    return {location->second, shard.dataOffset + tensorInfo(name, shard).offset};
+}
+
 } // namespace rt
 } // namespace trt_edgellm

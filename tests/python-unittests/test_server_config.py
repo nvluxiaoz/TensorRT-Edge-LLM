@@ -218,6 +218,23 @@ def test_cli_forwards_http_configuration(monkeypatch, tmp_path):
     assert api.allowed_local_media_path == str(tmp_path)
 
 
+def test_gemma4_memory_options_are_parsed():
+    from experimental.server.config import parse_server_config
+
+    config = parse_server_config([
+        "google/gemma-4-E2B-it", "--lm-head-quantization", "int4",
+        "--ple-residency", "cached", "--embedding-quantization", "int8"
+    ])
+    kwargs = config.model.llm_kwargs()
+    assert kwargs["lm_head_quantization"] == "int4"
+    assert kwargs["ple_residency"] == "cached"
+    assert kwargs["embedding_quantization"] == "int8"
+    default = parse_server_config(["google/gemma-4-E2B-it"]).model
+    assert default.ple_residency == "resident"
+    assert default.lm_head_quantization == "fp16"
+    assert default.embedding_quantization == "fp16"
+
+
 def test_llm_serve_forwards_allowed_local_media_path(monkeypatch, tmp_path):
     from experimental.server.api import app as app_module
     from experimental.server.runtime import engine_client

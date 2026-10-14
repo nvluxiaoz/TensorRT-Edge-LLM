@@ -125,6 +125,7 @@ class Weights:
                  int4_gemm_plugin_version: int = 2,
                  checkpoint_source: str = "component",
                  tie_word_embeddings: bool = False,
+                 int4_lm_head: bool = False,
                  policy: Optional[WeightPolicy] = None) -> None:
         self.conversion = conversion
         checkpoint_dir = getattr(conversion, "checkpoint_dir", None)
@@ -146,6 +147,7 @@ class Weights:
             raise ValueError("checkpoint_source must be component or target")
         self.checkpoint_source = checkpoint_source
         self.tie_word_embeddings = bool(tie_word_embeddings)
+        self.int4_lm_head = int4_lm_head
         self._policy = policy or WeightPolicy()
 
     def close(self) -> None:
@@ -782,12 +784,16 @@ class Weights:
             in_features = int(qweight_shape[0]) * 8
             out_features = int(qweight_shape[1])
             if self.has(prefix + ".g_idx"):
-                activation_permutation = ParameterSpec((in_features, ),
-                                                       np.int32)
-                activation_permutation_recipe = self.checkpoint_binding(
-                    [prefix + ".g_idx"],
-                    assemble="gptq_activation_permutation",
-                    group_size=self.module_quant_group_size(prefix))
+                # A sequential g_idx permutes nothing, so no Gather is needed.
+                group_size = self.module_quant_group_size(prefix)
+                if not np.array_equal(self.array(prefix + ".g_idx"),
+                                      np.arange(in_features) // group_size):
+                    activation_permutation = ParameterSpec((in_features, ),
+                                                           np.int32)
+                    activation_permutation_recipe = self.checkpoint_binding(
+                        [prefix + ".g_idx"],
+                        assemble="gptq_activation_permutation",
+                        group_size=group_size)
             else:
                 activation_permutation = np.arange(in_features, dtype=np.int64)
                 activation_permutation_recipe = None
@@ -875,6 +881,36 @@ class Weights:
             logical_in_features=in_features,
         )
 
+    def int4_tied_lm_head(self, prefix: str) -> LinearWeights:
+        """Quantize a tied embedding head to symmetric INT4 (group 128)."""
+        table = self.f16(prefix + ".weight")
+        vocab_size, hidden_size = table.shape
+        if hidden_size % 128:
+            raise ValueError(f"{prefix}: INT4 head needs hidden size % 128 "
+                             f"== 0, got {hidden_size}")
+        packed, scales = [], []
+        for start in range(0, vocab_size, 4096):
+            rows = table[start:start + 4096].astype(np.float32)
+            grouped = rows.reshape(rows.shape[0], -1, 128)
+            scale = (np.maximum(np.abs(grouped).max(axis=2), 1e-4) / 7).astype(
+                np.float16)
+            nibbles = np.clip(
+                np.rint(grouped / scale.astype(np.float32)[..., None]), -7,
+                7) + 8
+            packed.append(
+                int4_pack._pack_for_gemm(
+                    nibbles.reshape(rows.shape).astype(np.uint8),
+                    self.int4_gemm_plugin_version))
+            scales.append(scale)
+        return LinearWeights(
+            quantization.QUANT_INT4_AWQ,
+            np.concatenate(packed),
+            weight_scale=np.ascontiguousarray(np.concatenate(scales).T),
+            group_size=128,
+            logical_out_features=vocab_size,
+            logical_in_features=hidden_size,
+        )
+
     def linear_descriptor(self,
                           prefix: str,
                           quant_type: str,
@@ -887,6 +923,8 @@ class Weights:
             raise ValueError(
                 f"{prefix}: quantization config selects NVFP4, but the "
                 "checkpoint has no NVFP4 weight and scale tensors")
+        if self.int4_lm_head and prefix in ("lm_head", "model.embed_tokens"):
+            return self.int4_tied_lm_head(prefix)
         if (quant_type == quantization.QUANT_NVFP4
                 and external_kind and self._policy.externalizes_parameter(
                     external_kind, prefix)):

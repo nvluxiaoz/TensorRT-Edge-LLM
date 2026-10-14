@@ -145,6 +145,19 @@ def main():
         help=("Gemma4 int4_awq/nvfp4 only: force-quantize down_proj to 4-bit. "
               "Off by default -- down_proj stays fp16 to preserve accuracy."))
     llm_parser.add_argument(
+        "--awq_full",
+        action="store_true",
+        help=("int4_awq only: ModelOpt awq_full (scale and clip search) "
+              "instead of awq_lite; slower, more accurate. For Gemma4 it also "
+              "quantizes down_proj."))
+    llm_parser.add_argument(
+        "--calib_seq_len",
+        type=int,
+        default=None,
+        help=("Calibrate on --num_samples unpadded text blocks of this many "
+              "tokens (e.g. 2048). Text only: models with a vision tower skip "
+              "their image calibration."))
+    llm_parser.add_argument(
         "--mtp_draft_dir",
         default=None,
         help=
@@ -184,6 +197,8 @@ def main():
             num_samples=args.num_samples,
             fuse_gdn_qkvzba_scales=args.fuse_gdn_qkvzba_scales,
             quantize_gemma4_down_proj=args.quantize_gemma4_down_proj,
+            awq_full=args.awq_full,
+            calib_seq_len=args.calib_seq_len,
         )
     elif args.command == "draft":
         if _is_dflash_family_draft(args.draft_model_dir):

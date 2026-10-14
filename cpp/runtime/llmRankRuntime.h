@@ -582,8 +582,12 @@ private:
     //! (prefill) and the shared `zeroDeepstackBroadcast` (all other phases).
     std::unique_ptr<DeepstackBinding> mDeepstack;
 
-    std::unique_ptr<MultimodalRunner> mVisionRunner{nullptr};      //!< Vision multimodal runner (optional)
-    std::unique_ptr<MultimodalRunner> mAudioRunner{nullptr};       //!< Audio multimodal runner (optional)
+    std::unique_ptr<MultimodalRunner> mVisionRunner{nullptr}; //!< Vision runner, built on first use
+    std::unique_ptr<MultimodalRunner> mAudioRunner{nullptr};  //!< Audio runner, built on first use
+    std::string mVisionEngineDir;                             //!< Empty when there is no vision engine
+    std::string mAudioEngineDir;                              //!< Empty when there is no audio engine
+    rt::Tensor mVisionContextMemory{};                        //!< Used only when the shared buffer is too small
+    rt::Tensor mAudioContextMemory{};
     std::unique_ptr<Alpamayo1ActionRunner> mActionRunner{nullptr}; //!< Action/diffusion head runner (optional)
     std::unique_ptr<ActionKvBatchCollector> mActionKvBatchCollector;
     tokenizer::Tokenizer* mTokenizer{nullptr};                 //!< Shared tokenizer owned by RuntimeCoordinator
@@ -669,6 +673,19 @@ private:
 
     //! Validate request shape/runtime compatibility.
     bool validateRequestConfig(LLMGenerationRequest const& request);
+
+    bool hasVisionEngine() const noexcept
+    {
+        return !mVisionEngineDir.empty();
+    }
+
+    bool hasAudioEngine() const noexcept
+    {
+        return !mAudioEngineDir.empty();
+    }
+
+    void ensureEncoderRunner(std::unique_ptr<MultimodalRunner>& runner, std::string const& engineDir,
+        rt::Tensor& contextMemory, cudaStream_t stream);
 
     //! Prepare per-request runtime state for models built with multimodal support.
     //! Runs multimodal preprocessing when audio or vision inputs are present.

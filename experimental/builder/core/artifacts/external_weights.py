@@ -155,7 +155,14 @@ def checkpoint_weight_bindings(args, cfg, bindings: Sequence[dict],
         # NVFP4 embeddings are materialized as FP16 runtime artifacts.
         bindings.append(embedding_binding(weights, cfg))
     if cfg is not None and externalizes_ple(args, cfg):
-        bindings.append(ple_embedding_binding(weights, cfg))
+        binding = ple_embedding_binding(weights, cfg)
+        if args.ple_residency == "cached":
+            # The runtime reads rows from the checkpoint file instead of uploading the table.
+            binding["ple_on_disk"] = True
+        bindings.append(binding)
+    elif cfg is not None and args.ple_residency == "cached":
+        raise ValueError("--ple-residency cached needs a Gemma 4 per-layer "
+                         "embedding read from the checkpoint")
     _share_tied_embedding(bindings, bool(cfg and cfg.tie_word_embeddings))
     source_layouts = Counter(
         binding.get("source_layout", "plugin") for binding in bindings)

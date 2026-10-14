@@ -426,14 +426,20 @@ class Gemma4ForCausalLM(NetworkModule):
         ] if cfg.hidden_size_per_layer_input > 0 else []
         return io
 
-    def _layer_ple(self, hidden_states, token_ple: List[object], index: int):
+    def _ple_projection(self, hidden_states):
+        """Model-level PLE projection [T, layers * ple]; computed once per step."""
         if self.ple_projection is None:
             return None
         cfg = self.cfg
         projected = self.ple_projection(hidden_states)
         projected = projected * np.float16(cfg.hidden_size**-0.5)
-        projected = projected.reshape(
+        return projected.reshape(
             (0, cfg.num_hidden_layers, cfg.hidden_size_per_layer_input))
+
+    def _layer_ple(self, projected, token_ple: List[object], index: int):
+        if projected is None:
+            return None
+        cfg = self.cfg
         projected = projected.transpose((0, 2, 1)).slice_last_dim(index, 1, 3)
         projected = projected.reshape((0, cfg.hidden_size_per_layer_input))
         projected = self.ple_projection_norm(projected)
@@ -447,6 +453,7 @@ class Gemma4ForCausalLM(NetworkModule):
         present = []
         pre_layer_hidden = []
         post_layer_hidden = []
+        ple_projected = self._ple_projection(io["inputs_embeds"])
         for index, layer in enumerate(self.layers):
             pre_layer_hidden.append(hidden_states)
             if self.cfg.uses_dual_rope:
@@ -454,7 +461,7 @@ class Gemma4ForCausalLM(NetworkModule):
                         == "full_attention" else io["rope_sliding"])
             else:
                 rope = io["rope"]
-            ple = self._layer_ple(io["inputs_embeds"], io["ple"], index)
+            ple = self._layer_ple(ple_projected, io["ple"], index)
             hidden_states, layer_present = layer(hidden_states,
                                                  io["past"][index], rope,
                                                  ragged, io["attention_mask"],

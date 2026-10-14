@@ -541,6 +541,7 @@ def _ensure_plugin_path() -> None:
         return
     project_root = Path(__file__).resolve().parents[3]
     search_dirs = [
+        project_root / "build",
         project_root / "build" / "core",
         project_root / "build" / "lib",
     ]
@@ -867,6 +868,9 @@ class LLM:
         context_cache_config: Optional[Union[ContextCacheConfig,
                                              Mapping[str, Any]]] = None,
         enable_in_flight_batching: bool = False,
+        embedding_quantization: str = "fp16",
+        lm_head_quantization: str = "fp16",
+        ple_residency: str = "resident",
     ):
         if not model:
             raise ValueError("'model' must be provided")
@@ -924,6 +928,9 @@ class LLM:
             max_draft_tree_size=max_draft_tree_size,
             max_image_tokens=max_image_tokens,
             max_image_tokens_per_image=max_image_tokens_per_image,
+            embedding_quantization=embedding_quantization,
+            lm_head_quantization=lm_head_quantization,
+            ple_residency=ple_residency,
         )
         spec_method = options.spec_type
         num_speculative_tokens = None
@@ -2180,6 +2187,13 @@ def load_model(**kwargs):
         if kwargs.pop("speculative_config", None):
             raise ValueError(
                 "standalone TTS models do not support speculative decoding")
+        if (kwargs.pop("embedding_quantization", "fp16") != "fp16"
+                or kwargs.pop("lm_head_quantization", "fp16") != "fp16"
+                or kwargs.pop("ple_residency", "resident") != "resident"):
+            raise ValueError(
+                "standalone TTS models do not support "
+                "--embedding-quantization, --lm-head-quantization or "
+                "--ple-residency")
         if kwargs.pop("enable_in_flight_batching", False):
             raise _ifb_unsupported_error(
                 ifb_unsupported_reason(None, model_type=model_type))

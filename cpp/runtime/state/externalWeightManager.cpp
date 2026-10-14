@@ -125,6 +125,12 @@ bool isPleEmbeddingBinding(Json const& binding)
     return binding.value("role", "") == "ple_embedding" || binding.value("engine_name", "") == "__ple_embedding__";
 }
 
+//! The builder marks a PLE table that is read from the checkpoint file at runtime instead of uploaded.
+bool isPleOnDiskBinding(Json const& binding)
+{
+    return isPleEmbeddingBinding(binding) && binding.value("ple_on_disk", false);
+}
+
 size_t nonnegativeSize(Json const& value, std::string const& label);
 
 uint8_t hexNibble(char value)
@@ -441,6 +447,7 @@ ExternalWeightManager& ExternalWeightManager::operator=(ExternalWeightManager&& 
     mPluginResourceRegistrations = std::move(other.mPluginResourceRegistrations);
     mEmbedding = std::move(other.mEmbedding);
     mPleEmbedding = std::move(other.mPleEmbedding);
+    mPleFileSource = std::move(other.mPleFileSource);
     mLoaded = std::exchange(other.mLoaded, false);
     mValidated = std::exchange(other.mValidated, false);
     mRegistered = std::exchange(other.mRegistered, false);
@@ -636,6 +643,7 @@ void ExternalWeightManager::load(std::filesystem::path const& engineDir, std::fi
                 = safetensors::dataTypeFromString(binding["dtype"].get_ref<std::string const&>());
             layouts[bindingIndex].shape = shape;
             layouts[bindingIndex].dtype = dtype;
+            layouts[bindingIndex].materialize = !isPleOnDiskBinding(binding);
         }
         bool const hasPackedNvfp4Weights = std::any_of(bindings.begin(), bindings.end(),
             [](Json const& binding) { return !binding.contains(kStorageAliasField) && isPackedNvfp4Binding(binding); });
@@ -643,11 +651,12 @@ void ExternalWeightManager::load(std::filesystem::path const& engineDir, std::fi
             for (size_t bindingIndex = 0; bindingIndex < bindings.size(); ++bindingIndex)
             {
                 Json const& binding = bindings[bindingIndex];
-                if (binding.contains(kStorageAliasField) || isPackedNvfp4Binding(binding) != packedNvfp4)
+                BindingLayout& layout = layouts[bindingIndex];
+                if (binding.contains(kStorageAliasField) || !layout.materialize
+                    || isPackedNvfp4Binding(binding) != packedNvfp4)
                 {
                     continue;
                 }
-                BindingLayout& layout = layouts[bindingIndex];
                 size_t const bytes = static_cast<size_t>(layout.shape.volume()) * utils::getTypeSize(layout.dtype);
                 ELLM_CHECK(bytes > 0, "Checkpoint binding has an empty tensor: " + binding.value("engine_name", ""));
                 storageBytes = alignWeightBytes(storageBytes);
@@ -857,6 +866,16 @@ void ExternalWeightManager::load(std::filesystem::path const& engineDir, std::fi
                 }
                 mEmbedding = std::move(tensor);
             }
+            else if (isPleOnDiskBinding(binding))
+            {
+                ELLM_CHECK(!mPleFileSource.has_value(), "Runtime config has multiple PLE embedding bindings");
+                std::string const key = binding.at("checkpoint_keys").at(0).get<std::string>();
+                CheckpointReader::View view;
+                ELLM_CHECK(checkpointFor(binding).findHost(key, view), "Checkpoint tensor not found: " + key);
+                auto const [file, offset] = checkpointFor(binding).locate(key);
+                mPleFileSource = PleFileSource{file, static_cast<int64_t>(offset), view.dtype, layout.shape[0],
+                    layout.shape[1], binding.value("embedding_scale", 1.0F)};
+            }
             else if (isPleEmbeddingBinding(binding))
             {
                 ELLM_CHECK(!mPleEmbedding.has_value(), "Runtime config has multiple PLE embedding bindings");
@@ -914,6 +933,12 @@ std::optional<Tensor> ExternalWeightManager::takePleEmbedding()
     std::optional<Tensor> embedding = std::move(mPleEmbedding);
     mPleEmbedding.reset();
     return embedding;
+}
+
+std::optional<PleFileSource> ExternalWeightManager::takePleFileSource()
+{
+    ELLM_CHECK(mLoaded, "takePleFileSource called before load");
+    return std::exchange(mPleFileSource, std::nullopt);
 }
 
 void ExternalWeightManager::validateAgainstEngine(EngineExecutor const& executor, std::string_view engineLabel)

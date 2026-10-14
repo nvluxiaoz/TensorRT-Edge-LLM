@@ -19,6 +19,7 @@
 
 #include "common/tensor.h"
 #include "runtime/exec/tensorMap.h"
+#include "runtime/preprocess/gemma4EmbeddingPreprocessor.h"
 
 #include <cuda_runtime.h>
 #include <filesystem>
@@ -82,6 +83,9 @@ public:
     //! Transfer the checkpoint-backed Gemma4 PLE table, if any.
     std::optional<Tensor> takePleEmbedding();
 
+    //! Transfer the checkpoint location of a PLE table the runtime config keeps on disk, if any.
+    std::optional<PleFileSource> takePleFileSource();
+
     size_t size() const noexcept
     {
         return mWeights.size();
@@ -105,6 +109,7 @@ private:
     std::vector<PluginResourceRegistration> mPluginResourceRegistrations{};
     std::optional<Tensor> mEmbedding{};
     std::optional<Tensor> mPleEmbedding{};
+    std::optional<PleFileSource> mPleFileSource{};
     bool mLoaded{false};
     bool mValidated{false};
     bool mRegistered{false};

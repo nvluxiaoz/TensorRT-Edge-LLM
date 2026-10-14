@@ -919,3 +919,58 @@ def test_vocoder_dir_copied_into_quantized_root():
         omni_mod._copy_vocoder_dir(same, same)
         assert os.path.isfile(
             os.path.join(same, "codec_decode_online", "model_weights.pt"))
+
+
+def test_packed_text_calibration_blocks_are_unpadded_and_start_with_bos():
+    quantize_mod = importlib.import_module(
+        "tensorrt_edgellm.quantization.quantize")
+
+    class Tokenizer:
+        bos_token_id = 2
+
+        def __call__(self, text, add_special_tokens):
+            assert not add_special_tokens
+            return {"input_ids": list(range(10, 10 + len(text.split())))}
+
+    documents = lambda: iter(["a b c d e"] * 20)  # noqa: E731
+    loader = quantize_mod._packed_text_calib_dataloader(Tokenizer(),
+                                                        documents,
+                                                        batch_size=2,
+                                                        num_samples=4,
+                                                        seq_len=8)
+    blocks = torch.cat(list(loader))
+    assert blocks.shape == (4, 8)
+    assert (blocks[:, 0] == 2).all()
+    assert (blocks[:, 1:] >= 10).all()
+
+    with pytest.raises(ValueError, match="holds only"):
+        quantize_mod._packed_text_calib_dataloader(Tokenizer(),
+                                                   lambda: iter(["a b"]),
+                                                   batch_size=1,
+                                                   num_samples=4,
+                                                   seq_len=8)
+
+
+def test_gemma4_global_attention_config_is_restored_after_export():
+    quantize_mod = importlib.import_module(
+        "tensorrt_edgellm.quantization.quantize")
+    with tempfile.TemporaryDirectory() as source, \
+            tempfile.TemporaryDirectory() as saved:
+        with open(os.path.join(source, "config.json"), "w") as f:
+            json.dump(
+                {
+                    "text_config": {
+                        "global_head_dim": 512,
+                        "num_global_key_value_heads": None
+                    }
+                }, f)
+        with open(os.path.join(saved, "config.json"), "w") as f:
+            json.dump({"text_config": {"head_dim": 256}}, f)
+        quantize_mod._restore_gemma4_global_attention_config(source, saved)
+        with open(os.path.join(saved, "config.json")) as f:
+            text_config = json.load(f)["text_config"]
+    assert text_config == {
+        "head_dim": 256,
+        "global_head_dim": 512,
+        "num_global_key_value_heads": None
+    }

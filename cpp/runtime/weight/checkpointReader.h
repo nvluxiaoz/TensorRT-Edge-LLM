@@ -114,6 +114,10 @@ public:
 
     bool find(std::string const& name, View& view) const;
 
+    //! Return the shard file and absolute byte offset of one tensor.
+    //! \throws std::runtime_error if the tensor is not in the checkpoint
+    std::pair<std::filesystem::path, size_t> locate(std::string const& name) const;
+
 private:
     struct TensorInfo
     {

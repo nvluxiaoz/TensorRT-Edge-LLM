@@ -15,8 +15,10 @@
  * limitations under the License.
  */
 
+#include "common/bindingNames.h"
 #include "common/cudaUtils.h"
 #include "kernels/embeddingKernels/embeddingKernels.h"
+#include "runtime/preprocess/gemma4EmbeddingPreprocessor.h"
 #include "testUtils.h"
 
 #include <cuda_bf16.h>
@@ -25,6 +27,8 @@
 
 #include <cmath>
 #include <cstdint>
+#include <filesystem>
+#include <fstream>
 #include <vector>
 
 using namespace trt_edgellm;
@@ -235,4 +239,67 @@ TEST(Gemma4PleGatherKernelTest, GathersBfloat16LayerOutputs)
 
     runGatherTest<__nv_bfloat16>(inputIds, kBatchSize, kSeqLen, kMaxBatchSize, kMaxSeqLen, kVocabSize, kNumLayers,
         kPleHiddenSize, /* imageTokenId = */ -1, /* audioTokenId = */ -1);
+}
+
+TEST(Gemma4PleGatherKernelTest, FileBackedPreprocessorMatchesResidentTable)
+{
+    constexpr int32_t kVocabSize = 16;
+    constexpr int32_t kNumLayers = 3;
+    constexpr int32_t kHiddenSize = 8;
+    constexpr int32_t kImageTokenId = 9;
+    constexpr int64_t kHeaderBytes = 24;
+    constexpr float kScale = 4.0F;
+    int64_t const cols = static_cast<int64_t>(kNumLayers) * kHiddenSize;
+
+    // BF16 rows in a file with a header, as in a checkpoint shard; the resident table holds them scaled in FP16.
+    std::vector<__nv_bfloat16> fileRows(static_cast<size_t>(kVocabSize * cols));
+    std::vector<half> residentRows(fileRows.size());
+    for (size_t idx = 0; idx < fileRows.size(); ++idx)
+    {
+        float const value = static_cast<float>((idx / cols) * 3 + idx % 5) * 0.25F;
+        fileRows[idx] = __float2bfloat16(value);
+        residentRows[idx] = __float2half(value * kScale);
+    }
+    std::filesystem::path const file = std::filesystem::temp_directory_path() / "gemma4_ple_rows_test.bin";
+    {
+        std::ofstream out(file, std::ios::binary);
+        std::vector<char> const header(kHeaderBytes, 0);
+        out.write(header.data(), header.size());
+        out.write(reinterpret_cast<char const*>(fileRows.data()), fileRows.size() * sizeof(__nv_bfloat16));
+    }
+
+    rt::LLMEngineConfig config{};
+    config.pleEnabled = true;
+    config.numPleInputs = kNumLayers;
+    config.pleHiddenSize = kHiddenSize;
+    config.imageTokenId = kImageTokenId;
+    rt::TensorMap residentMap;
+    rt::TensorMap fileMap;
+    rt::Tensor residentTable({kVocabSize, cols}, rt::DeviceType::kGPU, DataType::kHALF);
+    copyHostToDevice(residentTable, residentRows);
+    rt::Gemma4EmbeddingPreprocessor resident(
+        "", config, 1, 6, residentMap, nullptr, std::optional<rt::Tensor>(std::move(residentTable)));
+    rt::Gemma4EmbeddingPreprocessor fileBacked("", config, 1, 6, fileMap, nullptr, std::nullopt,
+        rt::PleFileSource{file, kHeaderBytes, DataType::kBF16, kVocabSize, cols, kScale});
+
+    // Repeated, image and out-of-vocabulary tokens exercise the zero-fill and the per-token row reads.
+    std::vector<int32_t> const ids{3, kImageTokenId, 3, kVocabSize - 1, 99, 0};
+    rt::Tensor idsDevice({1, 6}, rt::DeviceType::kGPU, DataType::kINT32);
+    copyHostToDevice(idsDevice, ids);
+    resident.embed(idsDevice, nullptr);
+    fileBacked.embed(idsDevice, nullptr);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    for (int32_t layerIdx = 0; layerIdx < kNumLayers; ++layerIdx)
+    {
+        std::string const name = binding_names::formatPleTokenEmbedsName(layerIdx);
+        auto const expected = copyDeviceToHost<half>(*residentMap.get(name));
+        auto const actual = copyDeviceToHost<half>(*fileMap.get(name));
+        ASSERT_EQ(expected.size(), actual.size());
+        for (size_t idx = 0; idx < expected.size(); ++idx)
+        {
+            EXPECT_EQ(__half2float(actual[idx]), __half2float(expected[idx])) << "layer=" << layerIdx << " idx=" << idx;
+        }
+    }
+    std::filesystem::remove(file);
 }

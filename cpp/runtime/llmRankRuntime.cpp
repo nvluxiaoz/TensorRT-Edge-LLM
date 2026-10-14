@@ -340,6 +340,7 @@ void LLMRankRuntime::initializeCommon(ModelArtifacts&& artifacts, std::string co
     std::unique_ptr<EngineExecutor> draftExecutor = std::move(artifacts.draftExecutor);
     ExternalWeightManager draftWeights = std::move(artifacts.draftWeights);
     auto pleEmbedding = std::move(artifacts.pleEmbedding);
+    auto pleFileSource = preparedWeights.takePleFileSource();
     auto vocabMap = std::move(artifacts.vocabMap);
 
     // The same engine uses bounded SWA pages when they save memory and its full KV profile otherwise or for reuse.
@@ -556,7 +557,8 @@ void LLMRankRuntime::initializeCommon(ModelArtifacts&& artifacts, std::string co
     {
         int32_t const maxPleSeqLen = std::max(maxInputLength, std::max(1, mDeployment.base.maxVerifyTreeSize));
         mGemma4Ple = std::make_unique<Gemma4EmbeddingPreprocessor>(std::filesystem::path(engineDir), mDeployment.base,
-            mMaxRuntimeBatchSize, maxPleSeqLen, mBaseTensorMap, stream, std::move(pleEmbedding));
+            mMaxRuntimeBatchSize, maxPleSeqLen, mBaseTensorMap, stream, std::move(pleEmbedding),
+            std::move(pleFileSource));
     }
     LOG_INFO("Runtime tensors successfully allocated.");
 
@@ -590,32 +592,24 @@ void LLMRankRuntime::initializeCommon(ModelArtifacts&& artifacts, std::string co
     // -----------------------------------------------------------------------
     if (!multimodalEngineDir.empty())
     {
-        // A missing engine file means the deployment simply has no such
-        // encoder. One that is present but fails to load is fatal: continuing
-        // would answer image and audio prompts from the text tokens alone.
-        auto loadRunner = [&](std::string const& dir, std::string const& engineFile,
-                              std::string const& name) -> std::unique_ptr<MultimodalRunner> {
-            if (!std::filesystem::exists(std::filesystem::path(dir) / engineFile))
-            {
-                LOG_DEBUG("No %s engine at %s/%s", name.c_str(), dir.c_str(), engineFile.c_str());
-                return nullptr;
-            }
-            LOG_DEBUG("Attempting to load %s runner from %s", name.c_str(), dir.c_str());
-            auto runner = MultimodalRunner::create(dir, mDeployment.base.maxSupportedBatchSize,
-                mDeployment.base.maxKVCacheCapacity, stream, mCheckpointDir);
-            LOG_INFO("%s runner successfully initialized", name.c_str());
-            return runner;
-        };
-
-        mAudioRunner = loadRunner(multimodalEngineDir + "/audio", "audio_encoder.engine", "Audio");
-        mVisionRunner = loadRunner(multimodalEngineDir + "/visual", "visual.engine", "Visual");
-        if (!mVisionRunner)
+        // A missing engine file means the deployment has no such encoder. A runner is built by the first
+        // request that carries its modality; a failure to load it then fails that request.
+        namespace fs = std::filesystem;
+        if (fs::exists(fs::path(multimodalEngineDir) / "audio" / "audio_encoder.engine"))
         {
-            mVisionRunner = loadRunner(multimodalEngineDir, "visual.engine", "Vision");
+            mAudioEngineDir = multimodalEngineDir + "/audio";
+        }
+        if (fs::exists(fs::path(multimodalEngineDir) / "visual" / "visual.engine"))
+        {
+            mVisionEngineDir = multimodalEngineDir + "/visual";
+        }
+        else if (fs::exists(fs::path(multimodalEngineDir) / "visual.engine"))
+        {
+            mVisionEngineDir = multimodalEngineDir;
         }
 
-        // At least one multimodal runner must be available
-        ELLM_CHECK(mAudioRunner || mVisionRunner, "No valid multimodal engine found in " + multimodalEngineDir);
+        // At least one multimodal engine must be available
+        ELLM_CHECK(hasAudioEngine() || hasVisionEngine(), "No valid multimodal engine found in " + multimodalEngineDir);
 
         // Try to load action expert from multimodalEngineDir/action
         try
@@ -646,6 +640,8 @@ void LLMRankRuntime::initializeCommon(ModelArtifacts&& artifacts, std::string co
                     "Action engine max_kv_cache_capacity (%d) does not match LLM engine max_kv_cache_capacity (%d). "
                     "Re-export and rebuild the action engine with --max_kv_cache_capacity=%d to match the LLM engine.",
                     actionMaxKVCacheCapacity, llmMaxKVCacheCapacity, llmMaxKVCacheCapacity));
+            // The action path reads MRoPE deltas from the vision runner.
+            ensureEncoderRunner(mVisionRunner, mVisionEngineDir, mVisionContextMemory, stream);
         }
     }
 
@@ -726,12 +722,41 @@ void LLMRankRuntime::initializeCommon(ModelArtifacts&& artifacts, std::string co
         static_cast<size_t>(audioContextMemorySize), static_cast<size_t>(actionContextMemorySize));
 
     // Encoder embedding cache — content-addressed GPU cache for ViT/audio encoder outputs.
-    if ((mVisionRunner || mAudioRunner) && contextCacheConfig.encoderEmbeddingCacheBudgetBytes > 0)
+    if ((hasVisionEngine() || hasAudioEngine()) && contextCacheConfig.encoderEmbeddingCacheBudgetBytes > 0)
     {
         auto const budgetBytes = contextCacheConfig.encoderEmbeddingCacheBudgetBytes;
         mEncoderEmbeddingCache = std::make_unique<EncoderEmbeddingCache>(budgetBytes);
         LOG_INFO("Encoder embedding cache initialized with %zu MiB budget.",
             static_cast<size_t>(budgetBytes / (1024 * 1024)));
+    }
+}
+
+void LLMRankRuntime::ensureEncoderRunner(std::unique_ptr<MultimodalRunner>& runner, std::string const& engineDir,
+    rt::Tensor& contextMemory, cudaStream_t stream)
+{
+    if (runner != nullptr || engineDir.empty())
+    {
+        return;
+    }
+    runner = MultimodalRunner::create(
+        engineDir, mDeployment.base.maxSupportedBatchSize, mDeployment.base.maxKVCacheCapacity, stream, mCheckpointDir);
+    LOG_INFO("Multimodal runner for %s successfully initialized", engineDir.c_str());
+    // During init the shared buffer does not exist yet and is bound by its sizing step.
+    if (mSharedExecContextMemory.isEmpty())
+    {
+        return;
+    }
+    // The shared buffer is sized for the base engines and must not grow, so a larger encoder gets its own.
+    int64_t const required = runner->getRequiredContextMemorySize();
+    if (required > mSharedExecContextMemory.getMemoryCapacity())
+    {
+        contextMemory = rt::Tensor(
+            {required}, rt::DeviceType::kGPU, nvinfer1::DataType::kUINT8, "LLMRankRuntime::encoderContextMemory");
+        runner->setContextMemory(contextMemory);
+    }
+    else
+    {
+        runner->setContextMemory(mSharedExecContextMemory);
     }
 }
 
@@ -1422,8 +1447,8 @@ LLMRankRuntime::GenerationSession::AdmissionIntent LLMRankRuntime::GenerationSes
     bool const hasMedia = !item.imageBuffers.empty() || !item.audioBuffers.empty();
     if (hasMedia)
     {
-        ELLM_CHECK((item.imageBuffers.empty() || mRuntime.mVisionRunner != nullptr)
-                && (item.audioBuffers.empty() || mRuntime.mAudioRunner != nullptr),
+        ELLM_CHECK((item.imageBuffers.empty() || mRuntime.hasVisionEngine())
+                && (item.audioBuffers.empty() || mRuntime.hasAudioEngine()),
             "admitRequest: the request carries media this deployment has no encoder for.");
         // Visual-token pruning runs only in the founding prefill (it gates on an empty base KV),
         // so a media joiner would silently skip it and generate a different answer than the same
@@ -1820,8 +1845,7 @@ std::unique_ptr<LLMRankRuntime::SteppedGeneration> LLMRankRuntime::beginGenerati
         mDeployment.base.maxNumSequences, mDeployment.base.maxQueryLength, mDeployment.base.maxPhysicalTokens,
         mDeployment.base.recurrentPoolRows, /* mixedStepSupported = */ false});
     context.layerDebugger = LayerDebugger::fromEnv();
-    bool const supportsMultimodalInput
-        = (mAudioRunner != nullptr) || (mVisionRunner != nullptr) || (mActionRunner != nullptr);
+    bool const supportsMultimodalInput = hasAudioEngine() || hasVisionEngine() || (mActionRunner != nullptr);
 
     if (supportsMultimodalInput)
     {
@@ -2472,12 +2496,12 @@ bool LLMRankRuntime::validateRequestConfig(LLMGenerationRequest const& request)
             }
         }
     }
-    if (hasAudio && !mAudioRunner)
+    if (hasAudio && !hasAudioEngine())
     {
         LOG_ERROR("Request contains audio input, but this runtime does not have an audio runner.");
         return false;
     }
-    if (hasVision && !mVisionRunner)
+    if (hasVision && !hasVisionEngine())
     {
         LOG_ERROR("Request contains vision input, but this runtime does not have a vision runner.");
         return false;
@@ -2506,6 +2530,15 @@ bool LLMRankRuntime::multiModalRuntimePreprocess(LLMGenerationRequest const& req
         request.requests.begin(), request.requests.end(), [](auto const& req) { return !req.imageBuffers.empty(); });
     bool const hasTrajectoryHistory = std::any_of(request.requests.begin(), request.requests.end(),
         [](auto const& req) { return req.pastTrajectory.has_value(); });
+
+    if (hasAudio)
+    {
+        ensureEncoderRunner(mAudioRunner, mAudioEngineDir, mAudioContextMemory, stream);
+    }
+    if (hasVision)
+    {
+        ensureEncoderRunner(mVisionRunner, mVisionEngineDir, mVisionContextMemory, stream);
+    }
 
     // Clear request-scoped multimodal state up front so previous requests cannot leak through reused runtime members.
     context.visualEmbeddings = std::nullopt;

@@ -148,7 +148,26 @@ def write_embedding(weights: Weights, cfg: DeviceConfig, args,
         weight = weights.f16("model.embed_tokens.weight")
     weight = np.ascontiguousarray(weight * np.float16(cfg.embedding_scale))
     path = os.path.join(engine_dir, "embedding.safetensors")
-    if args.fp8_embedding:
+    if args.embedding_quantization == "int8":
+        # NumPy twin of quantize_embedding_to_int8 (the device venv has no torch).
+        encoded = np.empty(weight.shape, dtype=np.int8)
+        scales = np.empty(weight.shape[0], dtype=np.float32)
+        step = max(1, (16 << 20) // weight.shape[1])
+        for row in range(0, weight.shape[0], step):
+            rows = weight[row:row + step].astype(np.float32)
+            if not np.isfinite(rows).all():
+                raise ValueError("Embedding contains non-finite values")
+            amax = np.abs(rows).max(axis=1)
+            scale = np.where(amax > 0, amax / np.float32(127.0),
+                             np.float32(1.0)).astype(np.float32)
+            encoded[row:row + step] = np.clip(np.rint(rows / scale[:, None]),
+                                              -127, 127).astype(np.int8)
+            scales[row:row + step] = scale
+        save_safetensors(path, {
+            "embedding": encoded,
+            "embedding_scale": scales
+        })
+    elif args.fp8_embedding:
         if weight.shape[1] % 128:
             raise ValueError(
                 "FP8 embedding hidden size must be divisible by 128")

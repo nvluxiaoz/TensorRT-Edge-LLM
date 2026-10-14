@@ -33,6 +33,7 @@ and action models on NVIDIA edge platforms.
    user_guide/examples/vla/index.md
    user_guide/examples/omni.md
    user_guide/examples/experimental-server.md
+   user_guide/examples/gemma4-e2b-orin-nano.md
    user_guide/examples/nemo-evaluator.md
 
 .. toctree::

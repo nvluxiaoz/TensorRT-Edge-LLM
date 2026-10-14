@@ -23,6 +23,7 @@ import pytest
 safetensors_numpy = pytest.importorskip("safetensors.numpy")
 
 from experimental.builder.core import quantization, weight_policy
+from experimental.builder.core.artifacts.embeddings import write_embedding
 from experimental.builder.core.artifacts.external_weights import (
     _share_tied_embedding, checkpoint_identity, patch_external_weight_config)
 from experimental.builder.core.safetensors_np import (SafetensorsStore,
@@ -48,6 +49,27 @@ def _binding(engine_name, key="model.embed_tokens.weight", **extra):
         "shape": [8, 4],
         **extra,
     }
+
+
+def test_int8_embedding_sidecar_round_trips_with_row_scales(tmp_path):
+    table = np.random.default_rng(0).normal(size=(40, 16)).astype(np.float16)
+    table[3] = 0
+    weights = SimpleNamespace(is_nvfp4=lambda _: False, f16=lambda _: table)
+    cfg = SimpleNamespace(embedding_scale=2.0)
+    args = SimpleNamespace(embedding_quantization="int8", fp8_embedding=False)
+    write_embedding(weights, cfg, args, str(tmp_path))
+
+    stored = safetensors_numpy.load_file(
+        str(tmp_path / "embedding.safetensors"))
+    assert stored["embedding"].dtype == np.int8
+    assert stored["embedding_scale"].shape == (40, )
+    scales = stored["embedding_scale"][:, None]
+    decoded = stored["embedding"] * scales
+    expected = table.astype(np.float32) * 2.0
+    assert np.all(np.abs(decoded - expected) <= scales)
+    assert np.all(decoded[3] == 0)
+    peaks = np.abs(stored["embedding"].astype(np.int32)).max(axis=1)
+    assert np.all(np.delete(peaks, 3) == 127)
 
 
 def test_checkpoint_identity_rejects_same_shape_different_content(tmp_path):

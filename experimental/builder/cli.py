@@ -65,6 +65,9 @@ def _build_args(args: argparse.Namespace, component: str):
         draft_model_dir=args.draft_model_dir or "",
         target_model_dir=args.target_model_dir or "",
         fp8_embedding=args.fp8_embedding,
+        embedding_quantization=args.embedding_quantization,
+        lm_head_quantization=args.lm_head_quantization,
+        ple_residency=args.ple_residency,
         plugin_path=args.plugin_path,
         profiling_detailed=args.profiling_detailed,
         dense_quant=args.dense,
@@ -344,6 +347,22 @@ def _add_build_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--draft-reduced-vocab-dir")
     parser.add_argument("--draft-model-dir")
     parser.add_argument("--fp8-embedding", action="store_true")
+    parser.add_argument(
+        "--embedding-quantization",
+        choices=("fp16", "int8"),
+        default="fp16",
+        help="int8 stores the token embedding with one scale per row.")
+    parser.add_argument(
+        "--lm-head-quantization",
+        choices=("fp16", "int4"),
+        default="fp16",
+        help="int4 quantizes a tied embedding head (symmetric, group 128).")
+    parser.add_argument(
+        "--ple-residency",
+        choices=("resident", "cached"),
+        default="resident",
+        help=("Gemma 4 per-layer embedding: resident uploads the table to the "
+              "GPU, cached reads the rows of each step from the checkpoint."))
     parser.add_argument(
         "--externalize-weights",
         action="append",
